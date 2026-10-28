@@ -61,11 +61,31 @@ automatically, in any column order:
 
 | What it is | Headings it recognises |
 |---|---|
+| Invoice Number | Invoice Number, Invoice No, Order No, PI Number |
+| Supplier Name | Supplier Name, Supplier, Customer Name, Vendor Name, Seller |
+| Supplier Number | Supplier Number, Supplier Code, Supplier Ref, Vendor No, Account No |
+| Supplier Details | Supplier Details, Supplier Address, Supplier Contact, Contact Details |
 | Brand | Brand, Make, Manufacturer |
 | Description | Description, Description Of Goods, Item, Product, Particulars |
 | Price | Unit Price, Price, Rate, Cost |
 | Model (SKU) | Model, Model (SKU), SKU, Part No, Item Code |
 | Quantity | Quantity, Qty, Pcs, Units *(leave it out and every item counts as 1)* |
+
+The first four describe the invoice as a whole rather than one item, so repeat
+the same value on every row — the value used on the most rows is the one taken.
+
+**Supplier Details holds the supplier's own contact details** — their phone,
+their address, their email — never Epsilon's. **Supplier Number** is the
+account or reference code for that supplier, such as `SUP-0012`.
+
+When an invoice names a supplier who has no number or details on file yet, both
+are saved onto their account, so the first invoice from a new supplier is what
+opens their account properly. Anything already on file is left alone: to change
+it, open the account and press **Edit details**. The invoice number is recorded
+against the order, which is also what lets a shipment find its order later.
+
+A file in the older layout — no invoice or supplier columns — still imports; it
+just leaves those details for you to fill in.
 
 Title rows above the headings are skipped, and a trailing `Total` row is
 ignored. Prices may be written as `3,337.08` or `$3,337.08`. `.xlsx`, `.xls`

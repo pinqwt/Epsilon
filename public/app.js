@@ -435,6 +435,33 @@ const api = {
     if (error) throw error;
   },
 
+  async updateParty(id, fields) {
+    const { error } = await sb.from('parties').update(fields).eq('id', id);
+    if (error) throw error;
+  },
+
+  /* The supplier number and contact details read off an invoice. A detail
+   * already on the account is left alone — what is on file was either typed in
+   * or came from an earlier invoice, and a thinner line on a later invoice
+   * should not wipe it. Returns which fields were actually filled in.
+   */
+  async savePartyDetails(partyId, { supplier_no, details }) {
+    if (!partyId) return [];
+    const { data: party, error: readErr } = await sb.from('parties')
+      .select('supplier_no,details').eq('id', partyId).maybeSingle();
+    if (readErr) throw readErr;
+    if (!party) return [];
+
+    const patch = {};
+    if (supplier_no && !String(party.supplier_no || '').trim()) patch.supplier_no = supplier_no;
+    if (details && !String(party.details || '').trim()) patch.details = details;
+    if (!Object.keys(patch).length) return [];
+
+    const { error } = await sb.from('parties').update(patch).eq('id', partyId);
+    if (error) throw error;
+    return Object.keys(patch);
+  },
+
   async invoices() {
     const { data, error } = await sb.from('invoices')
       .select('id,deal_id,invoice_no,file_path,file_name,uploaded_at')
@@ -552,9 +579,23 @@ function mimeFor(name) {
 
 /* --------------------------- spreadsheet import ------------------------ */
 
+/* The columns an invoice spreadsheet can carry. The first four say who the
+ * invoice is from and which invoice it is — they repeat on every line, and one
+ * value is taken for the whole file. The rest describe the goods, line by line.
+ */
 const FIELD_HINTS = {
-  party_name: ['supplier', 'supplier name', 'seller', 'sold by', 'bought from',
-    'vendor name', 'customer name', 'account name'],
+  invoice_no: ['invoice number', 'invoice no', 'invoice no.', 'invoice #', 'invoice num',
+    'invoice ref', 'proforma invoice no', 'proforma invoice number', 'pi number', 'pi no',
+    'order no', 'order number', 'bill number', 'bill no', 'invoice'],
+  party_name: ['supplier name', 'customer name', 'supplier', 'seller', 'sold by', 'bought from',
+    'vendor name', 'account name'],
+  party_no: ['supplier number', 'supplier no', 'supplier no.', 'supplier code', 'supplier ref',
+    'supplier id', 'supplier account', 'vendor number', 'vendor no', 'vendor code',
+    'customer number', 'customer no', 'customer code', 'account number', 'account no',
+    'account code', 'party number'],
+  party_details: ['supplier details', 'supplier detail', 'supplier address', 'supplier contact',
+    'supplier info', 'supplier information', 'vendor details', 'customer details',
+    'contact details', 'party details'],
   brand: ['brand', 'make', 'manufacturer', 'maker', 'vendor', 'company'],
   model: ['model (sku)', 'model(sku)', 'model', 'sku', 'part number', 'part no', 'partno',
     'item code', 'product code', 'code', 'cat no', 'catalogue', 'ref no'],
@@ -580,23 +621,38 @@ function scoreColumn(header, field) {
   return -1;
 }
 
-/** Finds the header row within the first rows and maps the five fields to columns. */
+/* One column can only mean one thing. Headings overlap — "Supplier Details"
+ * contains "details", "Supplier Number" contains "supplier" — so every
+ * field/column pair is scored and the strongest claims are settled first.
+ * That way "Supplier Details" goes to the details field and not to Description.
+ */
+function mapRow(cells) {
+  const claims = [];
+  for (const field of Object.keys(FIELD_HINTS)) {
+    for (let c = 0; c < cells.length; c++) {
+      const s = scoreColumn(cells[c], field);
+      if (s > 0) claims.push({ field, col: c, score: s });
+    }
+  }
+  claims.sort((a, b) => b.score - a.score);
+  const map = {};
+  const taken = new Set();
+  for (const { field, col } of claims) {
+    if (map[field] != null || taken.has(col)) continue;
+    map[field] = col;
+    taken.add(col);
+  }
+  return map;
+}
+
+/** Finds the header row within the first rows and maps each field to a column. */
 function detectLayout(rows) {
   const limit = Math.min(rows.length, 12);
   let best = { row: -1, hits: 0, map: {} };
 
   for (let r = 0; r < limit; r++) {
-    const cells = rows[r] || [];
-    const map = {};
-    let hits = 0;
-    for (const field of Object.keys(FIELD_HINTS)) {
-      let bestCol = -1, bestScore = 0;
-      for (let c = 0; c < cells.length; c++) {
-        const s = scoreColumn(cells[c], field);
-        if (s > bestScore) { bestScore = s; bestCol = c; }
-      }
-      if (bestCol >= 0) { map[field] = bestCol; hits++; }
-    }
+    const map = mapRow(rows[r] || []);
+    const hits = Object.keys(map).length;
     if (hits > best.hits) best = { row: r, hits, map };
   }
 
@@ -643,12 +699,83 @@ function rowsToItems(rows, headerRow, map) {
       party_name, brand, model, description,
       qty: q == null || q === 0 ? 1 : Math.abs(q),
       unit_price: p == null ? 0 : Math.abs(p),
+      // Who the invoice is from and which invoice it is. These repeat on every
+      // line; sheetInfo() boils them down to one value for the whole file.
+      party_no: String(get(row, 'party_no') ?? '').trim(),
+      party_details: String(get(row, 'party_details') ?? '').trim(),
+      invoice_no: String(get(row, 'invoice_no') ?? '').trim(),
     });
   }
   return out;
 }
 
-/** Opens the mapping dialog and resolves with the items the user accepted. */
+/* The invoice number and the party behind a whole spreadsheet. Each of these
+ * columns repeats its value down the sheet, so the one used on the most lines
+ * wins — a stray blank or a typo on a single line cannot decide it.
+ */
+function sheetInfo(items) {
+  const pick = (field) => {
+    const tally = new Map();
+    for (const it of items) {
+      const v = String(it[field] || '').trim();
+      if (v) tally.set(v, (tally.get(v) || 0) + 1);
+    }
+    const top = [...tally.entries()].sort((a, b) => b[1] - a[1])[0];
+    return top ? top[0] : '';
+  };
+  return {
+    party_name: pick('party_name'),
+    party_no: pick('party_no'),
+    party_details: pick('party_details'),
+    invoice_no: pick('invoice_no'),
+    total: items.reduce((a, it) => a + it.qty * it.unit_price, 0),
+  };
+}
+
+/* What an invoice spreadsheet leaves behind besides its items: its invoice
+ * number against the order, and the supplier's own number and contact details
+ * against their account. Nothing already on file is overwritten, so the first
+ * invoice from a new supplier is what opens their account properly.
+ * Returns plain-language notes on what was saved.
+ */
+async function saveSheetInfo(deal, info, invoices = []) {
+  const done = [];
+
+  if (info.party_no || info.party_details) {
+    const filled = await api.savePartyDetails(deal.party_id, {
+      supplier_no: info.party_no,
+      details: info.party_details,
+    });
+    if (filled.length) {
+      done.push(`${filled.includes('supplier_no') ? 'supplier number' : ''}${
+        filled.length === 2 ? ' and ' : ''}${filled.includes('details') ? 'contact details' : ''} saved to the account`);
+    }
+  }
+
+  /* A recorded invoice total becomes the bill, so an invoice is only put on
+   * file when the sheet priced it. An invoice number with nothing behind it
+   * would book a bill of zero and quietly flatten the order.
+   */
+  const same = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+  if (info.invoice_no && !(Number(info.total) > 0)) {
+    done.push(`invoice ${info.invoice_no} not recorded — add items or use “Upload an invoice” to give it a total`);
+  } else if (info.invoice_no && !invoices.some((v) => same(v.invoice_no, info.invoice_no))) {
+    await api.addInvoice({
+      deal_id: deal.id,
+      invoice_no: info.invoice_no,
+      invoice_date: deal.deal_date || null,
+      // The sheet is the invoice, so its lines are its total.
+      total: info.total,
+      currency: deal.currency,
+      parsed: true,
+    });
+    done.push(`invoice ${info.invoice_no} recorded`);
+  }
+
+  return done;
+}
+
+/** Opens the mapping dialog and resolves `{ items, info }` once accepted, or null. */
 function importItemsFlow(file) {
   return new Promise(async (resolve) => {
     let sheets;
@@ -683,7 +810,10 @@ function importItemsFlow(file) {
         </div>
         <p class="preview-note" id="imp-detect"></p>
         <div class="map-grid">
+          ${fieldRow('invoice_no', 'Invoice number')}
           ${fieldRow('party_name', 'Name', 'supplier or customer')}
+          ${fieldRow('party_no', 'Supplier number', 'their code')}
+          ${fieldRow('party_details', 'Supplier details', 'their phone, address')}
           ${fieldRow('brand', 'Brand')}
           ${fieldRow('description', 'Description')}
           ${fieldRow('unit_price', 'Price', 'per unit')}
@@ -740,8 +870,18 @@ function importItemsFlow(file) {
       const hr = Number($('#imp-header', m).value);
       const items = rowsToItems(rowsNow(), hr, currentMap());
       const detect = $('#imp-detect', m);
+      const info = sheetInfo(items);
+      // Say what was read off the invoice columns, so it is clear before saving
+      // which supplier this is and what will be kept on their account.
+      const read = [
+        info.invoice_no ? `invoice <b>${esc(info.invoice_no)}</b>` : null,
+        info.party_name ? `from <b>${esc(info.party_name)}</b>` : null,
+        info.party_no ? `no. <b>${esc(info.party_no)}</b>` : null,
+        info.party_details ? 'with contact details' : null,
+      ].filter(Boolean);
       detect.innerHTML = items.length
-        ? `Found <b>${items.length}</b> item${items.length === 1 ? '' : 's'}. Check them below, then import.`
+        ? `Found <b>${items.length}</b> item${items.length === 1 ? '' : 's'}${
+            read.length ? ` — ${read.join(', ')}` : ''}. Check them below, then import.`
         : 'No items found yet — try a different header row or column mapping.';
 
       // Every row is listed; the area scrolls so the mapping controls and the
@@ -796,7 +936,7 @@ function importItemsFlow(file) {
       const items = rowsToItems(rowsNow(), Number($('#imp-header', m).value), currentMap());
       if (!items.length) return;
       closeModal();
-      resolve(items);
+      resolve({ items, info: sheetInfo(items) });
     };
 
     const root = $('#modal-root');
@@ -950,11 +1090,48 @@ function extractFromLines(lines) {
   const text = lines.join('\n');
   const flat = lines.join(' ');
 
+  /* An invoice number hides behind a lot of different labels, and the next
+   * word is often not it: "PROFORMA INVOICE Order No: SOB-260500556" names the
+   * number after a second label, and a flattened spreadsheet reads "Invoice
+   * Number Supplier Name". So the labels are tried from most explicit down,
+   * and a candidate only counts when it carries a digit — as every invoice
+   * number does — and is not plainly another column's heading.
+   */
+  const NO_LABELS = [
+    /\b(?:proforma\s+)?(?:tax\s+)?invoice\s*(?:no|number|num|#|ref)\s*\.?\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9\-\/_]{2,30})/gi,
+    /\b(?:order|bill|pi|p\/i)\s*(?:no|number|#)\s*\.?\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9\-\/_]{2,30})/gi,
+    /\b(?:proforma\s+)?(?:tax\s+)?invoice\s*(?:no|number|num|#|ref)?\s*\.?\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9\-\/_]{2,30})/gi,
+  ];
+  const NOT_A_NUMBER = /^(no|number|num|date|to|of|ref|code|name|order|bill|supplier|customer|vendor|details?|brand|description|qty|quantity|price|model|sku|total|invoice|proforma|tax)$/i;
+  // The date often sits right after the label — "Invoice No … 08-Oct-2026" —
+  // and a piece of one ("Oct-2026") is no more an invoice number than the whole.
+  const LOOKS_LIKE_DATE = new RegExp(
+    `^(?:\\d{1,4}[-\\/.][A-Za-z0-9]{1,9}[-\\/.]\\d{2,4}`
+    + `|(?:${Object.keys(MONTHS).join('|')})[a-z]*[-\\/.\\s]*\\d{2,4})$`, 'i');
+  const isNumber = (s) => /\d/.test(s) && !NOT_A_NUMBER.test(s) && !LOOKS_LIKE_DATE.test(s);
   let invoiceNo = '';
-  const noMatch = flat.match(
-    /\b(?:proforma\s+)?invoice\s*(?:no|number|num|#|ref)?\s*\.?\s*[:#]?\s*([A-Za-z0-9][A-Za-z0-9\-\/_]{2,30})/i,
-  );
-  if (noMatch && !/^(no|number|date|to|of)$/i.test(noMatch[1])) invoiceNo = noMatch[1].replace(/[.,;]+$/, '');
+  for (const re of NO_LABELS) {
+    for (const m of flat.matchAll(re)) {
+      const hit = m[1].replace(/[.,;]+$/, '');
+      if (isNumber(hit)) { invoiceNo = hit; break; }
+    }
+    if (invoiceNo) break;
+  }
+  /* A document can print the label in a table heading and the number on the
+   * line underneath — "PI Number  Date  LPO Number" then "SOR-03180  08-Oct-2026",
+   * which is also the shape a spreadsheet takes once flattened. A heading line
+   * carries no digits of its own, so the first letters-then-digits token on the
+   * line below it is the number. Dates start with digits and are left alone.
+   */
+  if (!invoiceNo) {
+    const at = lines.findIndex((l) =>
+      /\b(?:invoice|pi|p\/i|order|bill)\s*(?:no|number|#)\b/i.test(l) && !/\d/.test(l));
+    const below = at >= 0 ? String(lines[at + 1] || '') : '';
+    // Only a whole token counts, never the tail of one: the "Oct-2026" inside
+    // "08-Oct-2026" must not pass for a number.
+    const tok = below.match(/(?<![\w\-\/])([A-Za-z]{1,6}[-\/]?\d[A-Za-z0-9\-\/_]{2,30})\b/);
+    if (tok && isNumber(tok[1])) invoiceNo = tok[1];
+  }
 
   let total = null;
   for (const re of TOTAL_PATTERNS) {
@@ -1197,6 +1374,7 @@ async function viewNewDeal(direction) {
   if (!canEdit()) return viewDenied();
   const dir = DIR[direction];
   let pending = [];
+  let sheet = {};   // invoice number and party details read off the imported file
 
   view().innerHTML = `
     <div class="page-head">
@@ -1219,6 +1397,11 @@ async function viewNewDeal(direction) {
           <label class="field">
             <span>${direction === 'receiving' ? 'Quote no' : 'Purchase no'}</span>
             <input name="reference" placeholder="generated automatically">
+          </label>
+          <label class="field">
+            <span>Invoice number <em>(optional)</em></span>
+            <input name="invoice_no" placeholder="read from the file"
+              autocapitalize="characters" spellcheck="false">
           </label>
           <label class="field">
             <span>Date</span>
@@ -1269,9 +1452,10 @@ async function viewNewDeal(direction) {
       </div>
       <div class="card-body">
         <div class="dropzone" id="new-drop">
-          <strong>Choose an Excel or CSV file</strong> with Brand, Description, Price and Model (SKU)
+          <strong>Choose an Excel or CSV file</strong> with Invoice Number, ${dir.word} Name,
+          ${dir.word} Number, ${dir.word} Details, Brand, Description, Unit Price, Model (SKU) and Quantity
           <small>or drag it here — .xlsx, .xls, .csv${direction === 'sending'
-            ? '. A supplier invoice (PDF) fills in the supplier, date and currency.' : ''}</small>
+            ? '. A supplier invoice (PDF) fills in the supplier, invoice number, date and currency.' : ''}</small>
           <input type="file" id="new-file" accept=".xlsx,.xls,.csv${direction === 'sending' ? ',.pdf' : ''}" hidden>
         </div>
         <div id="pending-preview"></div>
@@ -1327,6 +1511,8 @@ async function viewNewDeal(direction) {
     try { hit = matchParty(info.supplier, (await api.parties()).parties); } catch { /* fall back to the name as printed */ }
     const nameInput = $('#new-form [name=party]');
     if (nameInput && !nameInput.value.trim()) nameInput.value = hit ? hit.party.name : info.supplier;
+    const invInput = $('#new-form [name=invoice_no]');
+    if (invInput && !invInput.value.trim() && info.invoiceNo) invInput.value = info.invoiceNo;
     if (info.invoiceDate) $('#new-form [name=deal_date]').value = info.invoiceDate;
     if (info.currency && CURRENCIES.includes(info.currency)) $('#new-form [name=currency]').value = info.currency;
     toast(hit ? `Supplier “${info.supplier}” — using your existing account ${hit.party.name}`
@@ -1336,25 +1522,25 @@ async function viewNewDeal(direction) {
   const take = async (file) => {
     if (!file) return;
     if (direction === 'sending' && /\.pdf$/i.test(file.name)) return takeInvoicePdf(file);
-    const items = await importItemsFlow(file);
-    if (items) {
-      pending = items;
+    const got = await importItemsFlow(file);
+    if (got) {
+      pending = got.items;
+      sheet = got.info;
       showPending();
-      // The Name column tells us who the record is with, so fill the name in
-      // rather than make you retype it. It stays editable.
+      // The invoice columns tell us who the record is with and which invoice it
+      // is, so those are filled in rather than retyped. They stay editable.
       const nameInput = $('#new-form [name=party]');
-      if (nameInput && !nameInput.value.trim()) {
-        const tally = new Map();
-        for (const it of items) {
-          const n = String(it.party_name || '').trim();
-          if (n) tally.set(n, (tally.get(n) || 0) + 1);
-        }
-        const top = [...tally.entries()].sort((a, b) => b[1] - a[1])[0];
-        if (top) {
-          nameInput.value = top[0];
-          toast(`Name taken from the file: ${top[0]}`, 'ok');
-        }
+      if (nameInput && !nameInput.value.trim() && sheet.party_name) {
+        // Reuse the existing account where the name is a near match, so a legal
+        // suffix or a small difference in spelling does not open a second one.
+        let hit = null;
+        try { hit = matchParty(sheet.party_name, (await api.parties()).parties); } catch { /* use the name as printed */ }
+        nameInput.value = hit ? hit.party.name : sheet.party_name;
+        toast(hit ? `Name from the file: ${sheet.party_name} — using your existing account ${hit.party.name}`
+          : `Name taken from the file: ${sheet.party_name}`, 'ok');
       }
+      const invInput = $('#new-form [name=invoice_no]');
+      if (invInput && !invInput.value.trim() && sheet.invoice_no) invInput.value = sheet.invoice_no;
     }
   };
 
@@ -1384,6 +1570,21 @@ async function viewNewDeal(direction) {
       });
       if (pending.length) await api.addItems(deal.id, pending);
 
+      // The invoice number and the supplier's own details go on file with the
+      // order. What is typed into the form wins over what the file said.
+      const info = {
+        ...sheet,
+        invoice_no: String(f.get('invoice_no') || '').trim() || sheet.invoice_no || '',
+        total: pending.reduce((a, it) => a + it.qty * it.unit_price, 0),
+      };
+      let saved = [];
+      try {
+        saved = await saveSheetInfo(deal, info);
+      } catch (err) {
+        // The order itself is already created, so this must not lose it.
+        toast(`Order created, but its invoice details could not be saved: ${errText(err)}`, 'err');
+      }
+
       const down = Number(f.get('down_amount') || 0);
       if (down > 0) {
         await api.addPayment({
@@ -1399,6 +1600,7 @@ async function viewNewDeal(direction) {
       const bits = [
         pending.length ? `${pending.length} items imported` : 'no items yet',
         down > 0 ? `down payment ${money(down, f.get('currency'))} recorded` : null,
+        ...saved,
       ].filter(Boolean);
       toast(`${deal.reference} created — ${bits.join(', ')}`, 'ok');
       location.hash = `#/deal/${deal.id}`;
@@ -1708,13 +1910,22 @@ function wireDealActions(d, invoices) {
       if (act === 'import-items') {
         const file = await pickFile('.xlsx,.xls,.csv');
         if (!file) return;
-        const items = await importItemsFlow(file);
-        if (!items) return;
+        const got = await importItemsFlow(file);
+        if (!got) return;
+        const { items, info } = got;
         const replace = await confirmAction(
           `Import ${items.length} items. Replace the items already on this record?`, 'Replace');
         if (replace) await api.clearItems(d.id);
         await api.addItems(d.id, items);
-        toast(`${items.length} items imported`, 'ok');
+        // Same file, same invoice: its number and the supplier's details go on
+        // file too, so a re-import keeps the account as complete as a new order.
+        let saved = [];
+        try {
+          saved = await saveSheetInfo(d, info, invoices);
+        } catch (err) {
+          toast(`Items imported, but the invoice details could not be saved: ${errText(err)}`, 'err');
+        }
+        toast([`${items.length} items imported`, ...saved].join(' — '), 'ok');
         return reload();
       }
       if (act === 'add-item') return itemDialog(d, reload);
@@ -2253,6 +2464,22 @@ async function readFileLines(file) {
   return []; // a photo has no text to read
 }
 
+/* A spreadsheet names its columns, so the invoice number and the supplier are
+ * read from them rather than guessed at from the text. Flattening a sheet to
+ * lines puts the headings next to each other — "Invoice Number Supplier Name"
+ * — which is exactly what a loose "invoice no:" pattern reads wrongly.
+ */
+async function sheetHeaderInfo(file) {
+  const sheets = await readSheet(file);
+  for (const s of sheets) {
+    const { headerRow, map } = detectLayout(s.rows);
+    if (headerRow < 0) continue;
+    const info = sheetInfo(rowsToItems(s.rows, headerRow, map));
+    if (info.invoice_no || info.party_name || info.party_no) return info;
+  }
+  return {};
+}
+
 /** The quantity printed beside a model: the number that multiplies into the next one (qty × price = amount). */
 function qtyOnLine(line, model) {
   const at = line.toLowerCase().indexOf(String(model).trim().toLowerCase());
@@ -2276,6 +2503,10 @@ function rankOrders(lines, header, deals, itemsOf) {
     const items = itemsOf(d);
     let score = 0, hits = 0;
     const invNo = normKey(d.invoice_no), ref = normKey(d.reference);
+    // A spreadsheet gives its invoice number by name, so compare it outright
+    // as well as looking for it in the text.
+    const headerNo = normKey(header.invoiceNo);
+    if (invNo.length >= 4 && headerNo.length >= 4 && headerNo === invNo) score += 100;
     if (invNo.length >= 4 && flat.includes(invNo)) score += 100;
     if (ref.length >= 4 && flat.includes(ref)) score += 60;
     // The supplier on the invoice is the same account as the order's: a nudge, never enough on its own.
@@ -2562,7 +2793,9 @@ function shipmentInvoiceDialog({ waiting, itemsOf, shipsOf, done, preselect }) {
     const best = waiting.find((d) => d.id === preselect) || ranked[0]?.deal || waiting[0];
     deal = best;
     const first = ranked[0];
-    const from = header.supplier ? ` Supplier on the invoice: ${header.supplier}.` : '';
+    const from = header.supplier
+      ? ` Supplier on the invoice: ${header.supplier}${header.supplierNo ? ` (${header.supplierNo})` : ''}.`
+      : '';
     how = !waiting.length ? '' : preselect ? 'Order chosen from the list.'
       : !first ? `Could not tell which order this is — pick it below.${from}`
       : first.score >= 100 ? `Matched by invoice number.${from}`
@@ -2596,6 +2829,14 @@ function shipmentInvoiceDialog({ waiting, itemsOf, shipsOf, done, preselect }) {
     drop.innerHTML = `<strong>${esc(f.name)}</strong><small>Reading the invoice…</small>`;
     try { lines = await readFileLines(f); } catch (e) { lines = []; toast(errText(e), 'err'); }
     header = lines.length ? extractFromLines(lines) : {};
+    if (/\.(xlsx|xls|csv)$/i.test(f.name)) {
+      try {
+        const cols = await sheetHeaderInfo(f);
+        if (cols.invoice_no) header.invoiceNo = cols.invoice_no;
+        if (cols.party_name) header.supplier = cols.party_name;
+        if (cols.party_no) header.supplierNo = cols.party_no;
+      } catch { /* keep whatever reading it as text gave */ }
+    }
     drop.innerHTML = `<strong>${esc(f.name)}</strong>
       <small>${(f.size / 1024).toFixed(0)} KB — click to choose a different file</small>`;
     if (!waiting.length) { box.innerHTML = '<div class="empty">No order is waiting for goods.</div>'; return; }
@@ -2918,7 +3159,8 @@ async function viewAccounts() {
 
   // An account only shows while it has a live order. Ones whose every order
   // was deleted (the sample data) stay in the database but out of this list.
-  const rowsFor = (q) => parties.filter((p) => byParty.has(p.id) && matchAny(q, [p.uid, p.name, p.kind])).map((p) => {
+  const rowsFor = (q) => parties.filter((p) => byParty.has(p.id)
+      && matchAny(q, [p.uid, p.name, p.kind, p.supplier_no, p.details])).map((p) => {
     const lines = byParty.get(p.id) || [];
     const owed = lines.filter((l) => Number(l.balance) !== 0);
     return `
@@ -2928,6 +3170,7 @@ async function viewAccounts() {
           <strong>${esc(p.name)}</strong>
           <div class="row-meta">
             <span>${esc(KIND_TEXT[p.kind] || p.kind)}</span>
+            ${p.supplier_no ? `<span class="sku">${esc(p.supplier_no)}</span>` : ''}
             <span>${lines.reduce((a, l) => a + Number(l.deal_count), 0)} order${
               lines.reduce((a, l) => a + Number(l.deal_count), 0) === 1 ? '' : 's'}</span>
           </div>
@@ -3040,8 +3283,14 @@ async function viewParty(id) {
           <span>${esc(KIND_TEXT[p.kind] || p.kind)}</span>
         </div>
         <h2>${esc(p.name)} <span class="uid-chip is-big">${esc(p.uid)}</span></h2>
+        ${p.supplier_no ? `<p class="row-meta"><span>${
+          esc(KIND_TEXT[p.kind] === 'Customer' ? 'Customer no' : 'Supplier no')}</span>
+          <strong class="sku">${esc(p.supplier_no)}</strong></p>` : ''}
+        ${p.details ? `<p class="party-details">${esc(p.details)}</p>` : ''}
         ${p.notes ? `<p>${esc(p.notes)}</p>` : ''}
       </div>
+      <div class="spacer"></div>
+      ${canEdit() ? '<button class="btn" data-act="edit-party" type="button">Edit details</button>' : ''}
     </div>
 
     ${totals.length ? `<div class="tiles">${totals.map((t) => `
@@ -3069,6 +3318,50 @@ async function viewParty(id) {
         ${rowsBlock(deals, 'No orders on this account yet.')}
       </div>
     </div>`;
+
+  // An invoice never overwrites a detail already on file, so this is where a
+  // number or an address that came in wrong gets put right.
+  $('[data-act=edit-party]')?.addEventListener('click', () => partyDialog(p, () => viewParty(id)));
+}
+
+function partyDialog(p, done) {
+  const word = p.kind === 'customer' ? 'Customer' : 'Supplier';
+  const m = openModal({
+    title: `Edit ${p.name}`,
+    width: '620px',
+    body: `<form id="f" class="grid-form">
+      <label class="field wide"><span>Name</span>
+        <input name="name" value="${esc(p.name)}" required></label>
+      <label class="field"><span>${word} number <em>(their code)</em></span>
+        <input name="supplier_no" value="${esc(p.supplier_no || '')}"
+          placeholder="e.g. SUP-0012" autocapitalize="characters" spellcheck="false"></label>
+      <label class="field"><span>Kind</span>
+        <select name="kind">${['supplier', 'customer', 'both'].map((k) =>
+          `<option value="${k}"${k === p.kind ? ' selected' : ''}>${KIND_TEXT[k]}</option>`).join('')}</select></label>
+      <label class="field wide"><span>${word} details <em>(their phone, address, email — not yours)</em></span>
+        <textarea name="details" rows="3" placeholder="+965 0000 0000 | Street, City | sales@example.com">${esc(p.details || '')}</textarea></label>
+      <label class="field wide"><span>Notes</span>
+        <textarea name="notes" rows="2">${esc(p.notes || '')}</textarea></label>
+    </form>`,
+    foot: `<button class="btn" data-close type="button">Cancel</button>
+           <button class="btn btn-primary" id="go" type="button">Save changes</button>`,
+  });
+
+  $('#go', m).onclick = async () => {
+    const f = new FormData($('#f', m));
+    const name = String(f.get('name') || '').trim();
+    if (!name) return toast('An account needs a name.', 'err');
+    try {
+      await api.updateParty(p.id, {
+        name,
+        kind: f.get('kind'),
+        supplier_no: String(f.get('supplier_no') || '').trim() || null,
+        details: String(f.get('details') || '').trim() || null,
+        notes: String(f.get('notes') || '').trim() || null,
+      });
+      closeModal(); toast('Saved', 'ok'); done();
+    } catch (e) { toast(errText(e), 'err'); }
+  };
 }
 
 /* ------------------------------ users admin ---------------------------- */

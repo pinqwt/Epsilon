@@ -772,3 +772,13 @@ a.uid-chip:hover { text-decoration: underline; }
 /* What is still owed to the supplier, small under Paid and plain in tables. */
 .to-pay { display: block; margin-top: 2px; font-size: 11.5px; color: var(--due); font-weight: 400; }
 .to-pay-inline { color: var(--due); }
+
+/* A party's own contact details, as read from the Supplier Details column. */
+.party-details {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--ink-2);
+  line-height: 1.55;
+  max-width: 62ch;
+  white-space: pre-wrap;
+}
