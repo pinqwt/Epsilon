@@ -875,6 +875,77 @@ function parseDateLoose(text) {
   }
 }
 
+/* The supplier is whoever issued the invoice: a labelled "Supplier: …" line if
+ * there is one, otherwise the first company-looking line in the header. Our own
+ * company (the "To" / "Bill to" block) is skipped, as are titles, addresses and
+ * phone lines, and lines with no Latin letters (the Chinese / Arabic twin of the name).
+ */
+const OWN_COMPANY = /epsilon/i;
+const COMPANY_SUFFIX = /\b(co\.?|ltd\.?|limited|llc|l\.l\.c|inc\.?|corp\.?|corporation|company|gmbh|fze|fzco|fzc|w\.?l\.?l\.?|est\.?|establishment|trading|industries|s\.?a\.?|b\.?v\.?)(?=[\s,.]|$)/i;
+const NOT_A_NAME = /^(proforma|pro-forma|tax|commercial|sales|purchase)?\s*(tax\s*)?(invoice|quotation|quote|order|packing\s*list|delivery\s*note)\b|^(add(ress)?|p\.?\s?o\.?\s*box|tel|fax|phone|web|email|e-mail|trn|vat|date|to|bill\s*to|ship\s*to|attn|mr|mrs|ms|dear|page|no|www)\b/i;
+
+function extractSupplierName(lines) {
+  const clean = (s) => s
+    .replace(/\s+(add(ress)?|p\.?\s?o\.?\s*box|tel|fax|phone|web|email|trn|vat)\b.*$/i, '')
+    .replace(/[\s,;:|-]+$/, '')
+    .replace(/\s+/g, ' ').trim();
+
+  for (const l of lines.slice(0, 40)) {
+    const m = l.match(/^(?:supplier|seller|vendor|sold\s*by|exporter|beneficiary|from)\s*(?:name)?\s*[:\-]\s*(.{3,80})$/i);
+    if (m && !OWN_COMPANY.test(m[1])) return clean(m[1]);
+  }
+
+  const head = lines.slice(0, 12).filter((l) => /[A-Za-z]{3}/.test(l) && !OWN_COMPANY.test(l) && !NOT_A_NAME.test(l.trim()));
+  const company = head.find((l) => COMPANY_SUFFIX.test(l) && l.length <= 90);
+  if (company) return clean(company);
+  // No "Ltd" / "FZE" at all (e.g. "Mindware For Computers"): the first plain name line.
+  const plain = head.find((l) => l.length <= 60 && !/\d{3}/.test(l) && !/[:@]/.test(l));
+  return plain ? clean(plain) : '';
+}
+
+/* Matching a name to an existing account, tolerant of legal suffixes and small
+ * spelling differences ("GUANGZHOU DSPPA AUDIO CO., LTD." ~ "Guanghzow").
+ */
+const PARTY_NOISE = new Set(['co', 'ltd', 'limited', 'llc', 'inc', 'corp', 'corporation', 'company', 'the', 'and', 'for', 'of',
+  'fze', 'fzco', 'fzc', 'wll', 'gmbh', 'est', 'establishment', 'group', 'international', 'trading', 'general', 'electrical',
+  'electronic', 'electronics', 'electric', 'industries', 'industrial', 'kuwait', 'middle', 'east', 'systems', 'security',
+  'lighting', 'marketing', 'power', 'telecom', 'cable', 'cables', 'computers']);
+const partyTokens = (s) => String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !PARTY_NOISE.has(t));
+
+function editDistance(a, b) { // optimal string alignment: a swapped pair of letters counts as one slip
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+    }
+  }
+  return d[a.length][b.length];
+}
+
+function partyScore(a, b) {
+  const ta = partyTokens(a), tb = partyTokens(b);
+  if (!ta.length || !tb.length) return 0;
+  if (ta.join(' ') === tb.join(' ')) return 1;
+  const same = (x, y) => x === y
+    || (x.length >= 4 && y.length >= 4 && (x.startsWith(y) || y.startsWith(x)))
+    || (x.length >= 6 && y.length >= 6 && editDistance(x, y) <= 2);
+  const hitsA = ta.filter((x) => tb.some((y) => same(x, y)));
+  const hitsB = tb.filter((y) => ta.some((x) => same(x, y)));
+  if (!hitsA.some((x) => x.length >= 5) && !hitsB.some((y) => y.length >= 5)) return 0; // nothing distinctive in common
+  return Math.max(hitsA.length / ta.length, hitsB.length / tb.length);
+}
+
+/** The existing account this name most likely is, or null when none is close (or two are equally close). */
+function matchParty(name, parties) {
+  const scored = parties.map((p) => ({ party: p, score: partyScore(name, p.name) }))
+    .filter((r) => r.score >= 0.6).sort((a, b) => b.score - a.score);
+  if (!scored.length) return null;
+  if (scored[1] && scored[1].score >= scored[0].score) return null;
+  return scored[0];
+}
+
 function extractFromLines(lines) {
   const text = lines.join('\n');
   const flat = lines.join(' ');
@@ -899,7 +970,7 @@ function extractFromLines(lines) {
   const dateLine = lines.find((l) => /invoice\s*date|^\s*date\b|date\s*[:#]/i.test(l));
   const invoiceDate = parseDateLoose(dateLine || '') || parseDateLoose(text);
 
-  return { invoiceNo, total, currency: detectCurrency(text), invoiceDate };
+  return { invoiceNo, total, currency: detectCurrency(text), invoiceDate, supplier: extractSupplierName(lines) };
 }
 
 async function readPdfLines(file) {
@@ -1199,8 +1270,9 @@ async function viewNewDeal(direction) {
       <div class="card-body">
         <div class="dropzone" id="new-drop">
           <strong>Choose an Excel or CSV file</strong> with Brand, Description, Price and Model (SKU)
-          <small>or drag it here — .xlsx, .xls, .csv</small>
-          <input type="file" id="new-file" accept=".xlsx,.xls,.csv" hidden>
+          <small>or drag it here — .xlsx, .xls, .csv${direction === 'sending'
+            ? '. A supplier invoice (PDF) fills in the supplier, date and currency.' : ''}</small>
+          <input type="file" id="new-file" accept=".xlsx,.xls,.csv${direction === 'sending' ? ',.pdf' : ''}" hidden>
         </div>
         <div id="pending-preview"></div>
       </div>
@@ -1245,8 +1317,25 @@ async function viewNewDeal(direction) {
       : '';
   };
 
+  // A supplier invoice: read who it is from, and reuse their existing account so no duplicate is made.
+  const takeInvoicePdf = async (file) => {
+    const info = await extractInvoice(file);
+    if (info.readError || !info.supplier) {
+      return toast('Could not find a supplier name on that invoice — type it in.', 'err');
+    }
+    let hit = null;
+    try { hit = matchParty(info.supplier, (await api.parties()).parties); } catch { /* fall back to the name as printed */ }
+    const nameInput = $('#new-form [name=party]');
+    if (nameInput && !nameInput.value.trim()) nameInput.value = hit ? hit.party.name : info.supplier;
+    if (info.invoiceDate) $('#new-form [name=deal_date]').value = info.invoiceDate;
+    if (info.currency && CURRENCIES.includes(info.currency)) $('#new-form [name=currency]').value = info.currency;
+    toast(hit ? `Supplier “${info.supplier}” — using your existing account ${hit.party.name}`
+      : `Supplier “${info.supplier}” — no existing account, a new one will be created`, 'ok');
+  };
+
   const take = async (file) => {
     if (!file) return;
+    if (direction === 'sending' && /\.pdf$/i.test(file.name)) return takeInvoicePdf(file);
     const items = await importItemsFlow(file);
     if (items) {
       pending = items;
@@ -2189,12 +2278,15 @@ function rankOrders(lines, header, deals, itemsOf) {
     const invNo = normKey(d.invoice_no), ref = normKey(d.reference);
     if (invNo.length >= 4 && flat.includes(invNo)) score += 100;
     if (ref.length >= 4 && flat.includes(ref)) score += 60;
+    // The supplier on the invoice is the same account as the order's: a nudge, never enough on its own.
+    const sameSupplier = !!header.supplier && partyScore(header.supplier, d.party) >= 0.6;
+    if (sameSupplier) score += 40;
     for (const it of items) {
       const k = normKey(it.model);
       if (k.length >= 3 && lineKeys.some((l) => l.includes(k))) hits++;
     }
     score += hits * 10;
-    return { deal: d, score, hits, total: items.length };
+    return { deal: d, score, hits, total: items.length, sameSupplier };
   }).filter((r) => r.score > 0).sort((a, b) => b.score - a.score);
 }
 
@@ -2470,10 +2562,12 @@ function shipmentInvoiceDialog({ waiting, itemsOf, shipsOf, done, preselect }) {
     const best = waiting.find((d) => d.id === preselect) || ranked[0]?.deal || waiting[0];
     deal = best;
     const first = ranked[0];
+    const from = header.supplier ? ` Supplier on the invoice: ${header.supplier}.` : '';
     how = !waiting.length ? '' : preselect ? 'Order chosen from the list.'
-      : !first ? 'Could not tell which order this is — pick it below.'
-      : first.score >= 100 ? 'Matched by invoice number.'
-      : `Matched by items (${first.hits} of ${first.total} found on the invoice).`;
+      : !first ? `Could not tell which order this is — pick it below.${from}`
+      : first.score >= 100 ? `Matched by invoice number.${from}`
+      : first.hits ? `Matched by items (${first.hits} of ${first.total} found on the invoice).${from}`
+      : `Matched by supplier only — check the items below.${from}`;
     const tie = !preselect && ranked.length > 1 && ranked[1].score >= ranked[0].score * 0.9;
     const order = [...new Set([deal, ...ranked.map((r) => r.deal), ...waiting])];
     box.innerHTML = `
