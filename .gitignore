@@ -1,0 +1,34 @@
+# --- Real commercial documents ---------------------------------------------
+# Supplier proforma invoices and their converted item lists: quoted prices,
+# contact names, phone numbers. Git history keeps these forever once pushed,
+# so they stay out. Redact prices first if a sample is ever needed in the repo.
+*.pdf
+*.PDF
+*.xlsx
+*.xls
+DSPPA-*.csv
+Mindware-*.csv
+NMK-*.csv
+
+# Generated knowledge graph - also caches the invoice contents above.
+graphify-out/
+
+# --- Secrets ----------------------------------------------------------------
+# Only the Supabase *publishable* key belongs in public/app.js CONFIG.
+.env
+.env.*
+*.key
+*.pem
+*service-role*
+*service_role*
+
+# --- Local machine state ----------------------------------------------------
+.claude/
+node_modules/
+.vscode/
+.idea/
+
+# --- OS cruft ---------------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store

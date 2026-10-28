@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Epsilon Billing</title>
+<link rel="icon" type="image/png" href="logo-mark.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div id="boot" class="boot"><div class="spinner"></div><p>Starting…</p></div>
+
+<!-- Sign in / first-run setup -->
+<section id="auth" class="auth" hidden>
+  <div class="auth-card">
+    <div class="auth-brand">
+      <img class="brand-logo brand-on-light" src="logo.png" alt="Epsilon" width="200" height="44">
+      <img class="brand-logo brand-on-dark" src="logo-dark.png" alt="" aria-hidden="true" width="200" height="44">
+      <h1>Billing</h1>
+      <p class="auth-sub">Electrical &amp; Electronic Contracting, Kuwait</p>
+    </div>
+
+    <form id="login-form" class="auth-form">
+      <label class="field">
+        <span>Username</span>
+        <input name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <p class="auth-error" id="login-error" hidden></p>
+      <button class="btn btn-primary btn-block" type="submit">Sign in</button>
+    </form>
+
+    <form id="setup-form" class="auth-form" hidden>
+      <div class="notice notice-info">
+        <strong>First run.</strong> No owner account exists yet. Create yours — this
+        password is set by you and is stored hashed, so nobody can read it back.
+      </div>
+      <label class="field">
+        <span>Username</span>
+        <input name="username" autocomplete="off" autocapitalize="none" spellcheck="false"
+               placeholder="lowercase letters, numbers, . _ -" required>
+      </label>
+      <label class="field">
+        <span>Display name <em>(optional)</em></span>
+        <input name="display_name" autocomplete="off" placeholder="Burhanuddin">
+      </label>
+      <label class="field">
+        <span>Password <em>(8 characters or more)</em></span>
+        <input name="password" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <label class="field">
+        <span>Repeat password</span>
+        <input name="password2" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <p class="auth-error" id="setup-error" hidden></p>
+      <button class="btn btn-primary btn-block" type="submit">Create owner account</button>
+    </form>
+  </div>
+</section>
+
+<!-- Main application -->
+<div id="shell" class="shell" hidden>
+  <aside class="sidebar">
+    <div class="side-brand">
+      <img class="brand-logo brand-on-light" src="logo.png" alt="Epsilon" width="200" height="44">
+      <img class="brand-logo brand-on-dark" src="logo-dark.png" alt="" aria-hidden="true" width="200" height="44">
+      <span class="brand-sub">Billing ledger</span>
+    </div>
+
+    <nav class="side-nav" id="side-nav">
+      <a class="nav-item" href="#/home" data-nav="home">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>
+        <span>Home</span>
+      </a>
+      <a class="nav-item nav-receiving" href="#/receiving" data-nav="receiving">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M19 12l-7 7-7-7"/></svg>
+        <span>Receiving</span>
+        <em class="nav-hint">sold</em>
+      </a>
+      <a class="nav-item nav-sending" href="#/sending" data-nav="sending">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>
+        <span>Sending</span>
+        <em class="nav-hint">purchases</em>
+      </a>
+      <a class="nav-item" href="#/shipments" data-nav="shipments">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 7v10l9 4 9-4V7"/><path d="M12 11v10"/></svg>
+        <span>Shipments</span>
+        <em class="nav-hint">receipts</em>
+      </a>
+      <a class="nav-item" href="#/overview" data-nav="overview">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        <span>Overview</span>
+        <em class="nav-hint">all orders</em>
+      </a>
+      <a class="nav-item" href="#/stock" data-nav="stock">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h16v12H4z"/><path d="M2 4h20v4H2z"/><path d="M10 12h4"/></svg>
+        <span>Stock</span>
+        <em class="nav-hint">on hand</em>
+      </a>
+      <a class="nav-item" href="#/accounts" data-nav="accounts">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18"/><path d="M7 15h4"/></svg>
+        <span>Accounts</span>
+        <em class="nav-hint">UIDs</em>
+      </a>
+      <a class="nav-item" href="#/users" data-nav="users" id="nav-users" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><path d="M16 5.2A3.2 3.2 0 0 1 16 11"/><path d="M18 14.2c2.3.7 4 2.7 4 5.8"/></svg>
+        <span>Users</span>
+      </a>
+    </nav>
+
+    <div class="side-foot">
+      <div class="side-user">
+        <div class="side-avatar" id="who-avatar">?</div>
+        <div class="side-who">
+          <strong id="who-name">—</strong>
+          <small id="who-role">—</small>
+        </div>
+      </div>
+      <div class="side-actions">
+        <button class="btn btn-ghost btn-sm" id="theme-toggle" type="button" title="Light / dark">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>
+        </button>
+        <button class="btn btn-ghost btn-sm" id="sign-out" type="button">Sign out</button>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <form class="search" id="search-form" role="search">
+        <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>
+        <input id="search-input" type="search" name="q" autocomplete="off"
+               placeholder="Search customer, supplier, invoice no, brand, model (SKU) or description…">
+        <button class="btn btn-primary" type="submit">Search</button>
+        <div id="suggest" class="suggest" hidden></div>
+      </form>
+      <button class="fx-chip" id="fx-chip" type="button" title="Exchange rate"><i class="fx-dot"></i>Rates…</button>
+      <button class="btn btn-primary" id="new-deal-btn" type="button">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        New
+      </button>
+    </header>
+    <div id="view" class="view"></div>
+  </main>
+</div>
+
+<div id="modal-root" class="modal-root" hidden></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/dist/umd/supabase.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
