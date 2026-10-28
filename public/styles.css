@@ -298,7 +298,6 @@ textarea { resize: vertical; min-height: 62px; }
 .nav-receiving.is-active svg { color: var(--settled); }
 .nav-sending.is-active svg { color: var(--part); }
 
-.nav-hint { margin-left: auto; font-style: normal; font-size: 11.5px; font-weight: 400; color: var(--ink-3); }
 
 .side-foot { margin-top: auto; display: grid; gap: 12px; padding-top: 16px; border-top: 1px solid var(--rule); }
 .side-user { display: flex; align-items: center; gap: 10px; padding: 0 8px; min-width: 0; }
@@ -556,7 +555,6 @@ table.data tfoot tr:last-child td { font-weight: 600; color: var(--ink); font-si
   .side-brand { padding: 0; }
   .side-name span { display: none; }
   .side-nav { grid-auto-flow: column; gap: 2px; margin-left: 10px; }
-  .nav-hint { display: none; }
   .side-foot { margin: 0 0 0 auto; padding: 0; border: 0; grid-auto-flow: column; align-items: center; gap: 10px; }
   .money-panel { grid-template-columns: 1fr; gap: 22px; }
   .money-side { border-top: 1px solid var(--rule); }

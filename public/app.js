@@ -3058,13 +3058,52 @@ async function viewOverview() {
  */
 async function viewStock() {
   setLoading();
-  const rows = (await api.stock()).map((r) => {
+  const [stock, deals, invoices] = await Promise.all([
+    api.stock(),
+    api.deals({ limit: 500 }),
+    api.invoices(),
+  ]);
+  const lines = await api.itemsFor(deals.map((d) => d.id));
+
+  /* stock_levels keys an item by its model, or by its description when there is
+   * no model. Keying the order lines the same way lets every stock line say
+   * where its goods came from — the supplier, their invoice number and the
+   * order — which the view's own party_names cannot, since that mixes the
+   * customers an item was sold to in with the suppliers it was bought from.
+   */
+  const keyOf = (it) => (String(it.model || '').trim() || String(it.description || '').trim())
+    .trim().toLowerCase();
+
+  const invoiceNos = new Map();
+  for (const v of invoices) {
+    if (!String(v.invoice_no || '').trim()) continue;
+    if (!invoiceNos.has(v.deal_id)) invoiceNos.set(v.deal_id, []);
+    invoiceNos.get(v.deal_id).push(v.invoice_no);
+  }
+
+  // Goods come in on purchases, so a stock line names its purchase orders only.
+  const dealById = new Map(deals.map((d) => [d.id, d]));
+  const byKey = new Map();
+  for (const it of lines) {
+    const d = dealById.get(it.deal_id);
+    if (!d || d.direction !== 'sending') continue;
+    const k = keyOf(it);
+    if (!k) continue;
+    if (!byKey.has(k)) byKey.set(k, new Map());
+    byKey.get(k).set(d.id, d);
+  }
+
+  const rows = stock.map((r) => {
     const received = Number(r.received), delivered = Number(r.delivered);
+    const from = [...(byKey.get(r.stock_key) || new Map()).values()];
     return {
       ...r,
       ordered: Number(r.ordered), received, sold: Number(r.sold), delivered,
       onHand: received - delivered,
       incoming: Number(r.ordered) - received,
+      from,
+      suppliers: [...new Set(from.map((d) => d.party).filter(Boolean))],
+      invoiceNos: [...new Set(from.flatMap((d) => invoiceNos.get(d.id) || []))],
     };
   });
   const n = (v) => qty(Math.round(v * 100) / 100);
@@ -3093,7 +3132,7 @@ async function viewStock() {
         <h3>Items</h3>
         <div class="spacer"></div>
         <div class="table-tools">
-          <input type="search" id="st-q" placeholder="Search model, brand, supplier UID">
+          <input type="search" id="st-q" placeholder="Search model, brand, supplier, invoice or order no">
           <select id="st-f">
             <option value="all">Show all</option>
             <option value="in">In stock</option>
@@ -3110,12 +3149,18 @@ async function viewStock() {
     const shown = rows.filter((r) => {
       if (f === 'in' && !(r.onHand > 0)) return false;
       if (f === 'incoming' && !(r.incoming > 0)) return false;
-      return matchAny(q, [r.sku, r.brand, r.description, r.party_uids, r.party_names]);
+      return matchAny(q, [r.sku, r.brand, r.description, r.party_uids, r.party_names,
+        r.suppliers.join(' '), r.invoiceNos.join(' '),
+        r.from.map((d) => d.reference).join(' ')]);
     });
+    const list = (vals, cls) => (vals.length
+      ? vals.map((v) => `<div${cls ? ` class="${cls}"` : ''}>${esc(v)}</div>`).join('')
+      : '<span class="dim">—</span>');
     $('#st-rows').innerHTML = shown.length ? `
       <div class="table-scroll"><table class="data">
         <thead><tr>
-          <th>Model (SKU)</th><th>Brand</th><th>Description</th><th>Accounts</th>
+          <th>Model (SKU)</th><th>Brand</th><th>Description</th>
+          <th>Supplier</th><th>Invoice no</th><th>Order</th><th>Account</th>
           <th class="r">Ordered</th><th class="r">Received</th><th class="r">Delivered</th>
           <th class="r">On hand</th><th class="r">Incoming</th>
         </tr></thead>
@@ -3124,6 +3169,11 @@ async function viewStock() {
             <td class="sku">${esc(r.sku)}</td>
             <td>${esc(r.brand || '')}</td>
             <td class="desc">${esc(r.description || '')}</td>
+            <td>${list(r.suppliers)}</td>
+            <td class="sku">${list(r.invoiceNos)}</td>
+            <td>${r.from.length
+              ? r.from.map((d) => `<div><a href="#/deal/${d.id}">${esc(d.reference || 'open')}</a></div>`).join('')
+              : '<span class="dim">—</span>'}</td>
             <td>${String(r.party_uids || '').split(',').filter(Boolean)
               .map((u) => `<span class="uid-chip">${esc(u)}</span>`).join(' ')}</td>
             <td class="r">${n(r.ordered)}</td>
