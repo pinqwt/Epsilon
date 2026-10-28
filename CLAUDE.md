@@ -32,7 +32,7 @@ down payment, paid and left to pay. Full user-facing docs are in `README.md`.
   - `PI-D261009LJ028.pdf` + `DSPPA-PI-D261009LJ028.xlsx` / `.csv` — 19 line items, invoice `D261009LJ028`.
   - `DSPPA-PI-D261009LJ028-rev12Oct.csv` — the 14-line revision of the same PI.
   - `PI-SOB-260500556.pdf` + `Mindware-SOB-260500556.csv` — 20 lines, invoice `SOB-260500556`.
-  - `SOR-03180_EPSILON- Available Items- PI.PDF` + `NMK-SOR-03180.csv` — 21 lines, invoice `SOR-03180`, the only one whose Supplier Number is filled (`CUS0000668`, the account code printed on that invoice). DSPPA and Mindware print no code, so theirs are blank for the owner to fill in.
+  - `SOR-03180_EPSILON- Available Items- PI.PDF` + `NMK-SOR-03180.csv` — 21 lines, invoice `SOR-03180` (NMK labels it "PI Number"). No invoice prints a code for the supplier itself, so every Supplier Number is blank for the owner to fill in.
 - `graphify-out/` was generated 2026-10-26 by a graphify run over this folder (AST extraction done, semantic cache for the converted CSV). No `graph.json` / report has been produced yet — the run was not completed.
 - Git repository on `main`, remote `pinqwt/Epsilon`; GitHub Pages serves `public/` via the root `index.html` redirect. Invoices and secrets are never committed.
 
