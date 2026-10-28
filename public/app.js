@@ -468,6 +468,15 @@ const api = {
     return data || [];
   },
 
+  /** The item lines of several orders at once, for working out what is still to arrive. */
+  async itemsFor(dealIds) {
+    if (!dealIds.length) return [];
+    const { data, error } = await sb.from('deal_items').select('*').in('deal_id', dealIds)
+      .order('position').order('id');
+    if (error) throw error;
+    return data || [];
+  },
+
   async stock() {
     const { data, error } = await sb.from('stock_levels').select('*').order('sku');
     if (error) throw error;
@@ -2135,20 +2144,135 @@ function viewDenied() {
 
 /* ------------------------------ shipments ------------------------------ */
 
-/* Its own ledger beside Receiving and Sending. Orders whose goods have not
- * all arrived wait at the top, showing the balance they are carrying (+ the
- * money already moved); typing a receipt number against one settles it.
+/* Reading a delivery invoice and working out which order it belongs to.
+ * Items are matched by their model / SKU, so it does not matter how the
+ * supplier laid the document out — if the model is on a line, the quantity
+ * is read from the numbers beside it.
  */
+const normKey = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const itemKey = (it) => normKey(it.model) || normKey(it.description).slice(0, 40);
+
+async function readFileLines(file) {
+  const ext = file.name.toLowerCase().split('.').pop();
+  if (ext === 'pdf') return readPdfLines(file);
+  if (['xlsx', 'xls', 'csv', 'txt'].includes(ext)) {
+    const sheets = await readSheet(file);
+    return sheets
+      .flatMap((s) => s.rows.map((r) => r.map((c) => String(c ?? '').trim()).filter(Boolean).join(' ')))
+      .filter(Boolean);
+  }
+  return []; // a photo has no text to read
+}
+
+/** The quantity printed beside a model: the number that multiplies into the next one (qty × price = amount). */
+function qtyOnLine(line, model) {
+  const at = line.toLowerCase().indexOf(String(model).trim().toLowerCase());
+  const nums = (s) => (s.match(/\d[\d,]*\.?\d*/g) || []).map(parseNum).filter((n) => n != null);
+  const pick = (list) => {
+    for (let i = 0; i + 2 < list.length; i++) {
+      if (Math.abs(list[i] * list[i + 1] - list[i + 2]) <= 0.01 * Math.abs(list[i + 2]) + 0.01) return list[i];
+    }
+    return list.length && Number.isInteger(list[0]) ? list[0] : null;
+  };
+  if (at < 0) return pick(nums(line));
+  const model_end = at + String(model).trim().length;
+  return pick(nums(line.slice(model_end))) ?? pick(nums(line.slice(0, at)));
+}
+
+/** Which of the waiting orders is this file for? Best first; invoice number beats item overlap. */
+function rankOrders(lines, header, deals, itemsOf) {
+  const flat = normKey(lines.join(' '));
+  const lineKeys = lines.map(normKey);
+  return deals.map((d) => {
+    const items = itemsOf(d);
+    let score = 0, hits = 0;
+    const invNo = normKey(d.invoice_no), ref = normKey(d.reference);
+    if (invNo.length >= 4 && flat.includes(invNo)) score += 100;
+    if (ref.length >= 4 && flat.includes(ref)) score += 60;
+    for (const it of items) {
+      const k = normKey(it.model);
+      if (k.length >= 3 && lineKeys.some((l) => l.includes(k))) hits++;
+    }
+    score += hits * 10;
+    return { deal: d, score, hits, total: items.length };
+  }).filter((r) => r.score > 0).sort((a, b) => b.score - a.score);
+}
+
+/** What this file says arrived, item by item, for one order. */
+function readArrivals(lines, items) {
+  return items.map((it) => {
+    const m = String(it.model || '').trim();
+    if (normKey(m).length < 3) return { found: false, qty: 0 };
+    const k = normKey(m);
+    const line = lines.find((l) => normKey(l).includes(k));
+    if (!line) return { found: false, qty: 0 };
+    const q = qtyOnLine(line, m);
+    // Listed on the invoice but no readable quantity: assume the full order, and flag it.
+    return { found: true, qty: q != null && q > 0 ? q : Number(it.qty), guessed: q == null || q <= 0 };
+  });
+}
+
+/** Units of each item that earlier shipments already brought in. */
+function receivedBefore(deal, items, ships) {
+  const pool = new Map();
+  let legacy = 0;
+  for (const s of ships) {
+    if (Array.isArray(s.items) && s.items.length) {
+      for (const it of s.items) pool.set(it.key, (pool.get(it.key) || 0) + Number(it.qty || 0));
+    } else legacy += Number(s.amount || 0); // recorded before items were tracked: by value
+  }
+  const frac = Number(deal.bill_total) > 0 ? Math.min(1, legacy / Number(deal.bill_total)) : 0;
+  return items.map((it) => {
+    const k = itemKey(it);
+    const take = Math.min(Number(it.qty), pool.get(k) || 0);
+    pool.set(k, (pool.get(k) || 0) - take);
+    return Math.min(Number(it.qty), take + Number(it.qty) * frac);
+  });
+}
+
+/** The result of booking `arrived` units now: what is left, and the goods value that brings the account to the right point. */
+function shipmentOutcome(deal, items, before, arrived) {
+  const dec = deal.cur_decimals;
+  let orderValue = 0, shipValue = 0, left = 0, leftLines = 0, units = 0;
+  const takes = items.map((it, i) => {
+    const ord = Number(it.qty), price = Number(it.unit_price);
+    const take = Math.max(0, Math.min(Number(arrived[i]) || 0, ord - before[i]));
+    orderValue += ord * price; shipValue += take * price; units += take;
+    const l = ord - before[i] - take;
+    if (l > 1e-9) { left += l; leftLines++; }
+    return take;
+  });
+  const remaining = Math.max(0, Number(deal.bill_total) - Number(deal.goods_value));
+  // Everything in: book exactly what is outstanding so the account lands on zero.
+  let amount = left <= 1e-9
+    ? remaining
+    : Math.min(remaining, orderValue > 0 ? Number((Number(deal.bill_total) * shipValue / orderValue).toFixed(dec)) : 0);
+  if (!items.length) { left = 0; leftLines = 0; amount = remaining; }
+  amount = Number(amount.toFixed(dec)); // whole currency decimals, so "zero left" is exactly zero
+  return { amount, left, leftLines, takes, units };
+}
+
 async function viewShipments() {
   setLoading();
   const [deals, shipments] = await Promise.all([api.deals({ limit: 500 }), api.shipments()]);
   const byId = new Map(deals.map((d) => [d.id, d]));
   const recorded = shipments.filter((s) => byId.has(s.deal_id));
   const waiting = deals.filter((d) => Number(d.bill_total) > 0 && Number(d.goods_value) < Number(d.bill_total));
+  const allItems = await api.itemsFor(waiting.map((d) => d.id));
+  const itemsOf = (d) => allItems.filter((i) => i.deal_id === d.id);
+  const shipsOf = (d) => recorded.filter((s) => s.deal_id === d.id);
+  // "3 items left" beside each waiting order, from the item list minus what arrived.
+  const itemsLeftOf = (d) => {
+    const items = itemsOf(d);
+    if (!items.length) return null;
+    const before = receivedBefore(d, items, shipsOf(d));
+    return items.reduce((s, it, i) => s + Math.max(0, Number(it.qty) - before[i]), 0);
+  };
 
   const waitingRows = (list) => list.map((d) => {
     const dir = DIR[d.direction];
     const bal = Number(d.balance);
+    const left = itemsLeftOf(d);
     return `
       <div class="row-ship">
         <span class="dir-badge dir-${dir.cls}" title="${dir.label}"><svg viewBox="0 0 24 24">${dir.icon}</svg></span>
@@ -2157,11 +2281,12 @@ async function viewShipments() {
           <div class="row-meta">
             <a href="#/deal/${d.id}">${esc(d.reference || 'Open order')}</a>
             <span>${dir.label}</span><span>${esc(dateLabel(d.deal_date))}</span>
+            ${left != null ? `<span><b>${qty(left)}</b> item${left === 1 ? '' : 's'} left</span>` : ''}
           </div>
         </div>
         <span class="cell cell-paid"><span class="cell-k">Paid</span>${fmt(d.paid, d.currency, d.cur_decimals)}</span>
         <span class="cell cell-bal"><span class="cell-k">Account</span>${balHtml(bal, d.currency, d.cur_decimals)}</span>
-        ${canEdit() ? `<button class="btn btn-sm btn-accent" data-act="ship" data-id="${d.id}" type="button">Add receipt</button>` : '<span></span>'}
+        ${canEdit() ? `<button class="btn btn-sm btn-accent" data-act="ship" data-id="${d.id}" type="button">Upload invoice</button>` : '<span></span>'}
       </div>`;
   }).join('');
 
@@ -2196,7 +2321,7 @@ async function viewShipments() {
       <div class="page-head">
         <div>
           <h2>Shipments</h2>
-          <p>Goods that arrived or went out. Add the receipt number and the account settles to zero.</p>
+          <p>Goods that arrived or went out. Upload the invoice and the order is matched for you — it settles to zero when every item is in, or shows how many are left.</p>
         </div>
         <div class="spacer"></div>
         <div class="table-tools">
@@ -2248,8 +2373,9 @@ async function viewShipments() {
     if (!canEdit()) return;
 
     try {
-      if (act === 'ship') return shipmentDialog(byId.get(btn.dataset.id), reload);
-      if (act === 'ship-pick') return shipmentPicker(waiting, reload);
+      const ctx = { waiting, itemsOf, shipsOf, done: reload };
+      if (act === 'ship') return shipmentInvoiceDialog({ ...ctx, preselect: btn.dataset.id });
+      if (act === 'ship-pick') return shipmentInvoiceDialog(ctx);
       if (act === 'del-ship') {
         const sh = recorded.find((x) => x.id === btn.dataset.id);
         if (!await confirmAction(
@@ -2260,19 +2386,165 @@ async function viewShipments() {
   });
 }
 
-function shipmentPicker(waiting, done) {
+/* Record shipment: the dialog opens on the upload box and nothing else. Once a
+ * file is in, the order it belongs to is worked out from the invoice number and
+ * the item models, the arrived quantities are read from it, and the result is
+ * shown before anything is saved — zero left, or how many items are still to come.
+ */
+function shipmentInvoiceDialog({ waiting, itemsOf, shipsOf, done, preselect }) {
+  let file = null, lines = [], header = {}, deal = null, items = [], before = [], arrivals = [], how = '';
+  const orderLabel = (d) =>
+    `${d.party} (${d.party_uid}) · ${d.reference || dateLabel(d.deal_date)} · ${DIR[d.direction].label}`;
+
   const m = openModal({
     title: 'Record a shipment',
-    body: `<label class="field"><span>Which order is it for?</span>
-      <select id="ship-pick">${waiting.map((d) => `<option value="${d.id}">${
-        esc(`${d.party} (${d.party_uid}) · ${d.reference || dateLabel(d.deal_date)} · ${DIR[d.direction].label}`)
-      }</option>`).join('')}</select></label>`,
+    width: '760px',
+    body: `<div class="dropzone" id="sx-drop">
+        <strong>Upload the invoice</strong>
+        <small>PDF, Excel, CSV or a photo — or drag it here. The order is found for you.</small>
+        <input type="file" id="sx-file" accept=".pdf,.xlsx,.xls,.csv,.png,.jpg,.jpeg,.webp" hidden>
+      </div>
+      <div id="sx-result"></div>`,
     foot: `<button class="btn" data-close type="button">Cancel</button>
-           <button class="btn btn-accent" id="go" type="button">Continue</button>`,
+           <button class="btn btn-accent" id="go" type="button" disabled>Save shipment</button>`,
   });
-  $('#go', m).onclick = () => {
-    const d = waiting.find((x) => x.id === $('#ship-pick', m).value);
-    if (d) shipmentDialog(d, done);
+  const drop = $('#sx-drop', m), input = $('#sx-file', m), box = $('#sx-result', m), go = $('#go', m);
+
+  const arrivedNow = () => $$('input[data-arrived]', m).map((i) => Number(i.value) || 0);
+
+  const paintSummary = () => {
+    const out = shipmentOutcome(deal, items, before, arrivedNow());
+    $$('[data-left]', m).forEach((c, i) => {
+      const l = Number(items[i].qty) - before[i] - out.takes[i];
+      c.textContent = qty(Math.max(0, l));
+      c.classList.toggle('dim', l <= 1e-9);
+    });
+    const dec = deal.cur_decimals;
+    const sum = $('#sx-sum', m);
+    if (!items.length) {
+      sum.className = 'entry-row entry-total';
+      sum.innerHTML = `<span>No item list on this order</span><b>Records the whole remaining ${money(out.amount, deal.currency, dec)}</b>`;
+    } else if (out.left <= 1e-9) {
+      sum.className = 'entry-row entry-total bal-even';
+      sum.innerHTML = `<span>Every item has arrived</span><b>Order settles to zero</b>`;
+    } else {
+      sum.className = 'entry-row entry-total bal-owed';
+      sum.innerHTML = `<span>Still to arrive</span><b>${qty(out.left)} item${out.left === 1 ? '' : 's'} left
+        (${out.leftLines} line${out.leftLines === 1 ? '' : 's'})</b>`;
+    }
+    go.disabled = !(out.units > 0 || !items.length) || !(out.amount > 0);
+    return out;
+  };
+
+  const paintOrder = () => {
+    items = itemsOf(deal);
+    before = receivedBefore(deal, items, shipsOf(deal));
+    arrivals = readArrivals(lines, items);
+    const rows = items.map((it, i) => {
+      const room = Number(it.qty) - before[i];
+      const a = arrivals[i];
+      const val = a.found ? Math.min(a.qty, room) : 0;
+      return `<tr>
+        <td>${esc(it.model || it.description || '—')}${a.guessed
+          ? ' <span class="dim" title="Listed on the invoice but no quantity could be read — check it.">· check qty</span>' : ''}</td>
+        <td class="r">${qty(it.qty)}</td>
+        <td class="r">${qty(before[i])}</td>
+        <td class="r"><input data-arrived type="number" min="0" max="${room}" step="any" value="${qty(val)}"
+            style="width:5.5rem;text-align:right" ${room <= 1e-9 ? 'disabled' : ''}></td>
+        <td class="r"><b data-left>0</b></td>
+      </tr>`;
+    }).join('');
+
+    $('#sx-items', m).innerHTML = items.length ? `
+      <div class="table-scroll"><table class="data">
+        <thead><tr><th>Item</th><th class="r">Ordered</th><th class="r">Already in</th>
+          <th class="r">Arrived now</th><th class="r">Left</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>` : '';
+    $$('input[data-arrived]', m).forEach((i) => i.addEventListener('input', paintSummary));
+    paintSummary();
+  };
+
+  const paintAll = () => {
+    const ranked = rankOrders(lines, header, waiting, itemsOf);
+    const best = waiting.find((d) => d.id === preselect) || ranked[0]?.deal || waiting[0];
+    deal = best;
+    const first = ranked[0];
+    how = !waiting.length ? '' : preselect ? 'Order chosen from the list.'
+      : !first ? 'Could not tell which order this is — pick it below.'
+      : first.score >= 100 ? 'Matched by invoice number.'
+      : `Matched by items (${first.hits} of ${first.total} found on the invoice).`;
+    const tie = !preselect && ranked.length > 1 && ranked[1].score >= ranked[0].score * 0.9;
+    const order = [...new Set([deal, ...ranked.map((r) => r.deal), ...waiting])];
+    box.innerHTML = `
+      <div class="grid-form" style="margin-top:1rem">
+        <label class="field wide"><span>Order</span>
+          <select id="sx-order">${order.map((d) => `<option value="${d.id}" ${d.id === deal.id ? 'selected' : ''}>${esc(orderLabel(d))}</option>`).join('')}</select>
+          <small class="${first || preselect ? '' : 'dim'}">${esc(how)}${tie ? ' Two orders look alike — check this is the right one.' : ''}</small>
+        </label>
+        <label class="field"><span>Receipt / invoice no</span>
+          <input name="receipt_id" value="${esc(header.invoiceNo || '')}" autocapitalize="characters" spellcheck="false"></label>
+        <label class="field"><span>Date</span>
+          <input name="shipped_on" type="date" value="${esc(header.invoiceDate || todayISO())}"></label>
+      </div>
+      <div class="entry-preview" style="margin-top:.75rem"><div id="sx-sum" class="entry-row"></div></div>
+      <div id="sx-items" style="margin-top:.75rem"></div>`;
+    $('#sx-order', m).addEventListener('change', (e) => {
+      deal = waiting.find((d) => d.id === e.target.value);
+      paintOrder();
+    });
+    paintOrder();
+  };
+
+  const handle = async (f) => {
+    if (!f) return;
+    file = f;
+    drop.innerHTML = `<strong>${esc(f.name)}</strong><small>Reading the invoice…</small>`;
+    try { lines = await readFileLines(f); } catch (e) { lines = []; toast(errText(e), 'err'); }
+    header = lines.length ? extractFromLines(lines) : {};
+    drop.innerHTML = `<strong>${esc(f.name)}</strong>
+      <small>${(f.size / 1024).toFixed(0)} KB — click to choose a different file</small>`;
+    if (!waiting.length) { box.innerHTML = '<div class="empty">No order is waiting for goods.</div>'; return; }
+    paintAll();
+  };
+
+  drop.addEventListener('click', () => input.click());
+  input.addEventListener('change', (e) => handle(e.target.files[0]));
+  drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('is-over'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('is-over'));
+  drop.addEventListener('drop', (e) => {
+    e.preventDefault(); drop.classList.remove('is-over');
+    handle(e.dataTransfer.files[0]);
+  });
+
+  go.onclick = async () => {
+    if (!deal || !file) return;
+    const out = paintSummary();
+    if (!(out.amount > 0)) return toast('Nothing arrived to record.', 'err');
+    go.disabled = true;
+    try {
+      const filePath = await api.uploadShipmentFile(deal.id, file);
+      await api.addShipment({
+        deal_id: deal.id,
+        receipt_id: String($('[name=receipt_id]', m).value || '').trim(),
+        shipped_on: $('[name=shipped_on]', m).value || todayISO(),
+        amount: out.amount,
+        carrier: '',
+        note: '',
+        file_path: filePath,
+        file_name: file.name,
+        file_size: file.size,
+        items: items.map((it, i) => ({ key: itemKey(it), model: it.model || it.description || '', qty: out.takes[i] }))
+          .filter((x) => x.qty > 0),
+      });
+      closeModal();
+      toast(out.left > 1e-9 ? `Shipment recorded — ${qty(out.left)} item${out.left === 1 ? '' : 's'} left`
+        : 'Shipment recorded — order settled to zero', 'ok');
+      done();
+    } catch (e) {
+      toast(errText(e), 'err');
+      go.disabled = false;
+    }
   };
 }
 

@@ -20,6 +20,7 @@ down payment, paid and left to pay. Full user-facing docs are in `README.md`.
 - Currency decimals: KWD/BHD/OMR/JOD/TND/LYD = 3, everything else = 2 (`CUR_DEC`), so "zero left" means exactly zero.
 - Excel/CSV import auto-detects headings (Brand, Description, Unit Price, Model/SKU, Quantity) in any order, skips title rows and a trailing Total row, shows a column-mapping preview before import.
 - Invoice upload (PDF/Excel/CSV) extracts invoice number, date, currency and total; prefers "Total after discount". An uploaded invoice's total replaces the item-list total as the bill; mismatch shows an amber warning. Newest invoice wins, older ones are kept. Files are private, opened via 10-minute signed links.
+- Record shipment (Shipments page) opens on an upload box only. The file is read, the order is matched by invoice number (+60 for order reference, +10 per item model found), arrived quantities are read from the lines carrying each model, and the result shows "settles to zero" or "N items left" before saving. A full delivery books exactly the outstanding value so the account lands on zero; a partial one books the value share of the items that arrived. `shipments.items` (jsonb `[{key, model, qty}]`) remembers which units arrived so later shipments know what is left. Logic: `rankOrders` / `readArrivals` / `shipmentOutcome` in `public/app.js`.
 - First run shows "Create owner account" (only one owner can be created this way); afterwards it is a normal login.
 
 ## Current state (as of 2026-10-26)
