@@ -34,6 +34,8 @@ The ERP build described in `Software_Sequence_Charts_With_Module_Screens.pdf`
 | | `erp_phase2_cancel_posted_goods_receipt` | |
 | | `erp_phase2_cancel_receipt_permission_fix` | |
 | | `erp_phase2_allocate_landed_cost` | |
+| `erp_activity_log_with_usernames.sql` | `erp_activity_log_with_usernames` | 20261029120328 |
+| `erp_views_security_invoker.sql` | `erp_views_security_invoker` | 20261029* |
 
 Each file was applied as several migrations because the tool rejects very large
 statements; the files group them by purpose. They match the deployed state, including
@@ -75,3 +77,17 @@ in the same change. Never edit a file that has already been applied — add anot
 Row-level security is the whole security boundary: the browser holds only the
 publishable key, which is public in `CONFIG`. Every new table needs its policies in the
 same migration that creates it, or it is readable by anyone with the key.
+
+**Every view needs `security_invoker = true`.** Without it a view reads its base
+tables with the view owner's rights and RLS never runs, so the view is readable by
+anyone holding the publishable key. This was a real hole: the four views added by the
+ERP work were missing it, and `order_progress` returned all 19 purchase lines to an
+anonymous caller. Fixed in `erp_views_security_invoker.sql`. To check that none have
+regressed:
+
+```sql
+select c.relname
+  from pg_class c join pg_namespace n on n.oid = c.relnamespace
+ where n.nspname = 'public' and c.relkind = 'v'
+   and coalesce(array_to_string(c.reloptions, ','), '') not like '%security_invoker=true%';
+```
