@@ -760,6 +760,16 @@ a.uid-chip:hover { text-decoration: underline; }
 .arr-none { background: var(--surface-2); color: var(--text-dim); }
 .arr-note { font-size: 0.78rem; color: var(--text-dim); margin-top: 2px; }
 .tile-wait .tile-dot { background: var(--due); }
+
+/* The history trail: what happened to a record and who did it. */
+.hist-act {
+  display: inline-block; padding: 1px 9px; border-radius: 999px;
+  font-weight: 600; font-size: 0.86rem; white-space: nowrap;
+  background: var(--surface-2); color: var(--text-dim);
+}
+.hist-deleted, .hist-cancelled { background: var(--due-wash); color: var(--due); }
+.hist-reversed { background: var(--part-wash); color: var(--part); }
+.hist-posted, .hist-restored, .hist-approved { background: var(--settled-wash); color: var(--settled); }
 .table-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .table-tools input[type=search] { width: 220px; }
 .row-acct .uid-chip { justify-self: start; }

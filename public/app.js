@@ -521,6 +521,18 @@ const api = {
     return data || [];
   },
 
+  /* Who changed this record, and why. Reads the audit trail by name rather
+   * than by user id, so a deletion says "Deleted by ultimate15", not a uuid.
+   */
+  async history(table, rowId) {
+    let q = sb.from('activity_log').select('*').order('at', { ascending: false }).limit(50);
+    if (table) q = q.eq('table_name', table);
+    if (rowId) q = q.eq('row_id', rowId);
+    const { data, error } = await q;
+    if (error) throw error;
+    return data || [];
+  },
+
   /* Is this invoice number already on file? The same number arriving twice is
    * usually the same bill entered twice, which would double what you owe.
    */
@@ -1871,12 +1883,73 @@ async function viewDeal(id) {
           <p class="preview-note" style="padding:10px 12px;margin:0">The newest invoice sets the bill total. Older ones are kept for your records.</p>`
           : `<div class="empty">No invoice uploaded. The bill is the item list total until you upload one.</div>`}
       </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>History</h3>
+        <div class="spacer"></div>
+        <span class="dim" style="font-size:12.5px">Who changed this record, and when</span>
+      </div>
+      <div class="card-body tight" id="dl-history">
+        <div class="empty">Loading…</div>
+      </div>
     </div>`;
 
   // Keep the ledger this record belongs to highlighted in the sidebar.
   for (const a of $$("[data-nav]")) a.classList.toggle("is-active", a.dataset.nav === d.direction);
 
+  paintHistory(d);
   wireDealActions(d, invoices);
+}
+
+/* The audit trail for one record, by name. Nothing here can be edited — it is
+ * written by the database as things happen, so it answers "who deleted this?"
+ * even when the record itself has been changed since.
+ */
+const ACTION_TEXT = {
+  deleted: 'Deleted', restored: 'Restored', posted: 'Posted',
+  cancelled: 'Cancelled', reversed: 'Reversed', approved: 'Approved',
+  created: 'Created',
+};
+
+async function paintHistory(d) {
+  const box = $('#dl-history');
+  if (!box) return;
+  let rows = [];
+  try {
+    rows = await api.history('deals', d.id);
+  } catch (e) {
+    box.innerHTML = `<div class="empty">Could not load the history (${esc(errText(e))}).</div>`;
+    return;
+  }
+
+  // A deletion recorded before the trail existed still shows, from the row.
+  if (d.deleted_at && !rows.some((r) => r.action === 'deleted')) {
+    rows.unshift({
+      id: 'row-deleted', action: 'deleted', at: d.deleted_at, reason: '',
+      actor_label: d.deleted_by_name || d.deleted_by_username || 'a removed user',
+    });
+  }
+
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">Nothing recorded yet. Changes from now on appear here.</div>';
+    return;
+  }
+
+  box.innerHTML = `
+    <div class="table-scroll"><table class="data">
+      <thead><tr><th>What</th><th>Who</th><th>When</th><th>Why</th></tr></thead>
+      <tbody>
+        ${rows.map((r) => `<tr>
+          <td><span class="hist-act hist-${esc(r.action)}">${esc(ACTION_TEXT[r.action] || r.action)}</span></td>
+          <td><b>${esc(r.actor_label || 'a removed user')}</b></td>
+          <td class="dim">${esc(new Date(r.at).toLocaleString('en-GB',
+            { dateStyle: 'medium', timeStyle: 'short' }))}</td>
+          <td>${r.reason ? esc(r.reason) : '<span class="dim">—</span>'}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table></div>`;
 }
 
 function wireDealActions(d, invoices) {
