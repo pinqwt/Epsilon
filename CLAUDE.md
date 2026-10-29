@@ -7,14 +7,23 @@ down payment, paid and left to pay. Full user-facing docs are in `README.md`.
 ## Architecture
 - No server, no build step. Static files in `public/` talk directly to Supabase from the browser.
 - `public/index.html` — layout. `public/styles.css` — light/dark theme, IBM Plex, orange `#ea7a00`.
-- `public/app.js` — all logic (~1950 lines, vanilla JS, `window.supabase` client). `CONFIG` is at the top (Supabase URL, publishable key, email domain).
+- `public/app.js` — all logic (~3950 lines, vanilla JS, `window.supabase` client). `CONFIG` is at the top (Supabase URL, publishable key, email domain).
+- `supabase/migrations/` — SQL for schema changes, so they can be reviewed in a diff. Its `README.md` maps each file to the migrations it was applied as, and warns that the 22 baseline migrations live only in Supabase's history, so the folder cannot rebuild the database from empty.
 - Logins are username-based: username is mapped to `<username>@<CONFIG.emailDomain>` for Supabase Auth. User management goes through an edge function (`callUsersFn`).
 - Permissions (see/edit/manage users) are enforced by database RLS, not just hidden in the UI.
 
 ## Supabase
 - Project **Epsilon Billing**, ref `mgxhwduuqdtxzxkhgfnc` (Frankfurt), account `mkerba2011@gmail.com`.
-- Tables: `deals`, `deal_items`, `payments`, `invoices`, `shipments`, `parties`, `profiles`; view `deal_list` computes bill / paid / left. `parties` carries `supplier_no` and `details` (migration `add_supplier_no_and_details_to_parties`, 2026-10-28).
+- Billing tables: `deals`, `deal_items`, `payments`, `invoices`, `shipments`, `parties`, `profiles`. Views `deal_list` / `deal_summary` / `deal_settlement` compute bill / paid / left; `account_entries` + `party_account` + `party_statement()` give a per-account statement; `stock_levels` gives on-hand. `parties` carries `supplier_no` and `details` (migration `add_supplier_no_and_details_to_parties`, 2026-10-28).
+- ERP tables (2026-10-29): `companies`, `warehouses`, `accounts` (chart of accounts), `items` + `item_costs`, `fx_rates`, `bank_accounts`, `doc_sequences`, `journals` + `journal_lines`, `stock_moves`, `audit_log`, `payment_allocations`, `posting_templates`, `period_locks`, `fx_conversions`; view `general_ledger`. 23 tables in all.
+- Helpers: `private.is_owner()` / `can_view(direction)` / `can_edit()` back every RLS policy. `currency_decimals(cur)` is the database half of `CUR_DEC`.
 - Free tier pauses after ~1 week idle — if the app can't reach the DB, Resume it in the dashboard.
+## ERP rebuild (the owner's target design)
+- The app is being rebuilt into the ERP specified in `Software_Sequence_Charts_With_Module_Screens.pdf` (in `C:\Users\mukke\Documents\Payments Epsilon\`, 29 Oct 2026): 12 pages of process and accounting rules, then 18 proposed module screens under a 10-item sidebar. Read it with `pdftotext -layout` — poppler is in `/mingw64/bin`, and there is no working Python or `pdftoppm`, so the Read tool cannot render PDFs here.
+- Decisions the owner made 2026-10-29, not to be reopened without them: **extend the existing tables in place** (not a fresh schema alongside); **weighted average costing**, FIFO explicitly dropped, so no cost-layer tables; and they chose to build **phase 5 before phases 2–4**.
+- Done: phase 1 (foundation + engine) and phase 5 (posting, currency, locks, reversals). **Left: phase 2 purchase documents, 3 sales documents, 4 AR/AP/bank, 6 reports and opening balances.**
+- Nothing posts by itself yet — the documents that raise the events (PO, GRN, delivery, sales invoice) are phases 2–4, so the UI is unchanged. The smallest step that makes the engine visibly live is wiring existing `payments` rows to `post_settlement()`.
+- Assumptions where the spec's "Confirm before coding" list went unanswered: base currency KWD, tax fields present but zero and unconfigured, negative stock blocked, posting needs `can_edit`, reversal needs owner.
 
 ## Behaviour to preserve
 - Currency decimals: KWD/BHD/OMR/JOD/TND/LYD = 3, everything else = 2 (`CUR_DEC`), so "zero left" means exactly zero.
@@ -27,9 +36,16 @@ down payment, paid and left to pay. Full user-facing docs are in `README.md`.
 - Stock lists, per item, the supplier, their invoice number and the order it came in on. `stock_levels` keys an item by `lower(model, else description)` as `stock_key`; `viewStock` keys the order lines the same way and joins. It reads those names from purchase orders only — the view own `party_names` mixes in the customers an item was sold to. An item shows "—" until an invoice number is recorded against its order.
 - The sidebar shows tab names only; the old sub-labels ("sold", "purchases", "receipts", "all orders", "on hand", "UIDs") were removed 2026-10-28 at the owner request.
 - First run shows "Create owner account" (only one owner can be created this way); afterwards it is a normal login.
+- **A reversed journal stays in `general_ledger`.** The view filters `status in ('posted','reversed')` on purpose: `reversed` means "corrected", not "never happened", and the linked mirror journal is what cancels it, so the pair nets to zero. Filtering to `posted` alone removes the original and leaves the mirror standing, which shows every corrected transaction as its own opposite. This was a real bug, caught on 2026-10-29.
+- Three rules live in the database, not in `app.js`, and must stay there: debit must equal credit at the moment of posting; a posted journal can only ever move to `reversed` (never edited, never deleted); and a unique index on `(source_table, source_id, event)` where `status = 'posted'` means one event posts once, so a retry or double-click cannot double-post.
+- The 13 event templates from spec page 9 are rows in `posting_templates`, not code, because the spec requires an accountant to validate the event-to-account mapping before real posting — `select * from posting_templates` is that review. Changing one re-routes every future journal, so it is owner-write only.
+- `fx_rate_for()` raises when no rate is on file rather than assuming 1:1, which would silently misstate every foreign balance. Rates are stored base-per-1-foreign (KWD per 1 USD), and `to_base()` rounds through `currency_decimals()` so KWD keeps 3 decimals.
+- Existing deals and payments carry `status = 'legacy'`: they were never journal-posted, and marking them `posted` would make the trial balance claim entries that do not exist. Opening stock is deliberately absent — per spec page 3 it needs an approved opening transaction, which is phase 6.
 
-## Current state (as of 2026-10-28)
-- App UI (`public/`) last edited 2026-10-28 (new invoice format: supplier name/number/details plus invoice number).
+## Current state (as of 2026-10-29)
+- Database carries ERP phases 1 and 5 (13 migrations, 2026-10-29). Verified on the live database inside an aborting transaction: spec page 26's settlement posts Dr 2100 3070.000 / Dr 6100 30.000 / Cr 1110 3100.000, the trial balance is level, edit and delete of a posted journal are refused, reversal nets every account to zero, a missing FX rate and a closed period both refuse. No rows and no document numbers were left behind, so the first real journal is still `JV-2026-000001`.
+- Existing screens untouched by that work: `deal_list` 11 rows, `stock_levels` 19, all 19 stock keys resolve to an item. 43 of 43 order lines are linked to `items`; all 11 parties hold `SUP-` codes (none are customers yet).
+- App UI (`public/`) last edited 2026-10-28 (new invoice format: supplier name/number/details plus invoice number). The ERP work added no UI.
 - Sample data in the project root, all four spreadsheets in the new format (converted 2026-10-28), their supplier details taken from the matching PDFs rather than invented:
   - `PI-D261009LJ028.pdf` + `DSPPA-PI-D261009LJ028.xlsx` / `.csv` — 19 line items, invoice `D261009LJ028`.
   - `DSPPA-PI-D261009LJ028-rev12Oct.csv` — the 14-line revision of the same PI.
@@ -39,6 +55,7 @@ down payment, paid and left to pay. Full user-facing docs are in `README.md`.
 - Git repository on `main`, remote `pinqwt/Epsilon`; GitHub Pages serves `public/` via the root `index.html` redirect. Invoices and secrets are never committed.
 
 ## Working notes
-- Keep edits inside `public/`; keep the three logo PNG filenames and transparent backgrounds.
+- Keep UI edits inside `public/`; keep the three logo PNG filenames and transparent backgrounds. Schema work goes in `supabase/migrations/`, applied under the same name and committed in the same change — never edit a migration that has already been applied, add another.
+- RLS is the whole security boundary: the browser holds only the publishable key, which is public in `CONFIG`. Every new table needs its policies in the same migration that creates it, or it is readable by anyone with that key. New Supabase tables have RLS *off* by default.
 - Don't paste real passwords or the service-role key into chat or files; only the publishable key belongs in `CONFIG`.
 - The README tells the owner to change any password they previously typed into a chat window.
