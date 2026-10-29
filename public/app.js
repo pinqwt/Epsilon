@@ -510,6 +510,30 @@ const api = {
     return data || [];
   },
 
+  /* Counted arrivals, per order line, from the goods receipts. Separate from
+   * stock_levels, which works received quantities out from money. Only
+   * purchases bring goods in, so sales lines are left out.
+   */
+  async arrivals() {
+    const { data, error } = await sb.from('order_progress').select('*')
+      .eq('direction', 'sending');
+    if (error) throw error;
+    return data || [];
+  },
+
+  /* Is this invoice number already on file? The same number arriving twice is
+   * usually the same bill entered twice, which would double what you owe.
+   */
+  async invoicesNumbered(no) {
+    const n = String(no || '').trim();
+    if (!n) return [];
+    const { data, error } = await sb.from('invoices')
+      .select('id, deal_id, invoice_no, total, currency, invoice_date')
+      .ilike('invoice_no', n);
+    if (error) throw error;
+    return data || [];
+  },
+
   async addShipment(row) {
     const { error } = await sb.from('shipments').insert(row);
     if (error) throw error;
@@ -2223,6 +2247,7 @@ function invoiceDialog(d, done) {
           <button class="btn btn-ghost btn-sm" type="button" data-pct="0">Reset</button>
         </div>
         <div class="entry-preview wide" id="iv-adjust"></div>
+        <div class="wide" id="iv-mistakes"></div>
         <p class="preview-note wide" style="margin:0">
           The price at the bottom becomes the bill for this record, in ${esc(dealCur)}, replacing the item list total.
           Check it against the invoice before saving.
@@ -2305,11 +2330,87 @@ function invoiceDialog(d, done) {
     box.innerHTML = rows;
   };
 
-  const refresh = () => { syncRate(); paintCheck(); paintAdjust(); };
+  /* Mistake check. The invoice total becomes the bill, so a wrong number here
+   * quietly changes what the order is worth. These are the ways it goes wrong
+   * in practice, each said plainly rather than as a validation error.
+   */
+  let dupes = [];
+  const paintMistakes = () => {
+    const box = $('#iv-mistakes', m);
+    if (!box) return;
+    const f = form();
+    const a = calc();
+    const bad = [];
+    const soft = [];
+
+    const totalTyped = f.total.value !== '';
+    if (totalTyped && !(a.base > 0)) {
+      bad.push(`<b>The total is zero.</b> A recorded total becomes the bill, and a zero
+        would flatten this order to nothing. Type the real invoice total.`);
+    }
+
+    if (dupes.length) {
+      const here = dupes.filter((v) => v.deal_id === d.id).length;
+      const elsewhere = dupes.filter((v) => v.deal_id !== d.id);
+      if (elsewhere.length) {
+        bad.push(`<b>This invoice number is already used on another order.</b>
+          ${esc(String(f.invoice_no.value).trim())} is on
+          ${elsewhere.map((v) => `<a href="#/deal/${v.deal_id}">another record</a>`).join(', ')}.
+          Entering the same bill twice doubles what you owe this supplier.`);
+      } else if (here) {
+        soft.push(`This order already has an invoice numbered
+          <b>${esc(String(f.invoice_no.value).trim())}</b>. Saving adds a newer one, and the
+          newest becomes the bill. That is right for a revised invoice, wrong for a repeat.`);
+      }
+    }
+
+    // The item list and the invoice should agree. When they do not, say by how much.
+    const items = Number(d.items_total);
+    if (totalTyped && a.base > 0 && items > 0 && (!a.converting || a.rate > 0)) {
+      const diff = a.value - items;
+      const off = Math.abs(diff);
+      if (off >= 1 / 10 ** dealDec) {
+        const pct = items ? (off / items) * 100 : 0;
+        const msg = `<b>This does not match the item list.</b> The items add up to
+          ${money(items, dealCur, dealDec)} but this invoice comes to
+          ${money(a.value, dealCur, dealDec)} — ${diff > 0 ? 'more' : 'less'} by
+          <b>${money(off, dealCur, dealDec)}</b>${pct >= 0.5 ? ` (${fmt(pct, null, 1)}%)` : ''}.
+          Either a price or quantity on the order is wrong, or the supplier has billed
+          the wrong amount. The invoice total is what will be used.`;
+        (pct >= 5 ? bad : soft).push(msg);
+      }
+    }
+
+    const dt = String(f.invoice_date.value || '');
+    if (dt && dt > new Date().toISOString().slice(0, 10)) {
+      soft.push(`The invoice date <b>${esc(dt)}</b> is in the future. Check it.`);
+    }
+
+    if (!bad.length && !soft.length) { box.innerHTML = ''; return; }
+    box.innerHTML = [
+      ...bad.map((h) => `<div class="notice notice-err" style="margin-bottom:10px">${h}</div>`),
+      ...soft.map((h) => `<div class="notice notice-warn" style="margin-bottom:10px">${h}</div>`),
+    ].join('');
+  };
+
+  // The duplicate lookup needs the database, so it runs on its own.
+  let dupTimer = null;
+  const checkDupes = () => {
+    clearTimeout(dupTimer);
+    dupTimer = setTimeout(async () => {
+      const no = String(form().invoice_no.value || '').trim();
+      if (!no) { dupes = []; paintMistakes(); return; }
+      try { dupes = await api.invoicesNumbered(no); } catch { dupes = []; }
+      paintMistakes();
+    }, 300);
+  };
+
+  const refresh = () => { syncRate(); paintCheck(); paintAdjust(); paintMistakes(); };
 
   form().addEventListener('input', (e) => {
     if (e.target.name === 'rate') rateTouched = true;
     if (e.target.name === 'currency') rateTouched = false;
+    if (e.target.name === 'invoice_no') checkDupes();
     refresh();
   });
   $('#iv-quick', m).addEventListener('click', (e) => {
@@ -2339,6 +2440,8 @@ function invoiceDialog(d, done) {
     fm.currency.value = detected || '';
     rateTouched = false;
     refresh();
+    // A number read from the file still has to be checked for a duplicate.
+    if (got.invoiceNo) checkDupes();
 
     const found = [
       got.invoiceNo && 'number', got.invoiceDate && 'date',
@@ -3053,15 +3156,41 @@ async function viewOverview() {
 
 /* --------------------------------- stock -------------------------------- */
 
+/* Says in plain words whether an item turned up. "Not arrived" and "partly
+ * arrived" come from counted goods receipts; "not counted" means nobody has
+ * recorded a receipt for it yet, which is not the same as it being missing.
+ */
+function arrivalChip(r) {
+  const n = (v) => qty(Math.round(v * 100) / 100);
+  if (r.arrival === 'arrived') {
+    return '<span class="arr-chip arr-ok">Arrived</span>';
+  }
+  if (r.arrival === 'partly arrived') {
+    return `<span class="arr-chip arr-part">Partly arrived</span>`
+      + `<div class="arr-note">${n(r.outstanding)} still to come</div>`;
+  }
+  if (r.arrival === 'arrived damaged') {
+    return `<span class="arr-chip arr-bad">Arrived damaged</span>`
+      + `<div class="arr-note">${n(r.damaged)} damaged, none accepted</div>`;
+  }
+  if (r.arrival === 'not arrived') {
+    return '<span class="arr-chip arr-bad">Not arrived</span>'
+      + '<div class="arr-note">ordered, nothing received yet</div>';
+  }
+  return '<span class="arr-chip arr-none">Not counted</span>'
+    + '<div class="arr-note">no goods receipt recorded</div>';
+}
+
 /* Worked out from the orders: what purchases brought in (as each order's
  * goods are recorded) less what sales delivered, matched on model / SKU.
  */
 async function viewStock() {
   setLoading();
-  const [stock, deals, invoices] = await Promise.all([
+  const [stock, deals, invoices, arrivals] = await Promise.all([
     api.stock(),
     api.deals({ limit: 500 }),
     api.invoices(),
+    api.arrivals(),
   ]);
   const lines = await api.itemsFor(deals.map((d) => d.id));
 
@@ -3093,9 +3222,42 @@ async function viewStock() {
     byKey.get(k).set(d.id, d);
   }
 
+  /* Counted arrivals, gathered by the same key. A goods receipt is the only
+   * thing that counts goods in, so an item with no receipt is "not counted"
+   * rather than "not arrived" — saying it had not arrived would be a guess,
+   * and the old Received column is already a guess worked out from money.
+   */
+  const arrivalByKey = new Map();
+  for (const a of arrivals) {
+    const k = String(a.item_label || '').trim().toLowerCase();
+    if (!k) continue;
+    const g = arrivalByKey.get(k)
+      || { ordered: 0, accepted: 0, damaged: 0, outstanding: 0, lines: 0 };
+    g.ordered += Number(a.qty_ordered) || 0;
+    g.accepted += Number(a.qty_accepted) || 0;
+    g.damaged += Number(a.qty_damaged) || 0;
+    g.outstanding += Number(a.qty_outstanding) || 0;
+    g.lines += 1;
+    arrivalByKey.set(k, g);
+  }
+  const countedKeys = new Set(
+    arrivals.filter((a) => (Number(a.qty_received) || 0) > 0 || (Number(a.qty_accepted) || 0) > 0)
+      .map((a) => String(a.item_label || '').trim().toLowerCase()));
+
   const rows = stock.map((r) => {
     const received = Number(r.received), delivered = Number(r.delivered);
     const from = [...(byKey.get(r.stock_key) || new Map()).values()];
+    const arr = arrivalByKey.get(r.stock_key);
+    const counted = countedKeys.has(r.stock_key);
+    let arrival = 'not counted';
+    if (counted && arr) {
+      if (arr.accepted >= arr.ordered) arrival = 'arrived';
+      else if (arr.accepted > 0) arrival = 'partly arrived';
+      else if (arr.damaged > 0) arrival = 'arrived damaged';
+      else arrival = 'not arrived';
+    } else if (arr && arr.ordered > 0) {
+      arrival = 'not arrived';
+    }
     return {
       ...r,
       ordered: Number(r.ordered), received, sold: Number(r.sold), delivered,
@@ -3104,12 +3266,20 @@ async function viewStock() {
       from,
       suppliers: [...new Set(from.map((d) => d.party).filter(Boolean))],
       invoiceNos: [...new Set(from.flatMap((d) => invoiceNos.get(d.id) || []))],
+      arrival,
+      counted,
+      accepted: arr ? arr.accepted : 0,
+      outstanding: arr ? arr.outstanding : 0,
+      damaged: arr ? arr.damaged : 0,
     };
   });
   const n = (v) => qty(Math.round(v * 100) / 100);
 
   const units = rows.reduce((a, r) => a + Math.max(0, r.onHand), 0);
   const incoming = rows.reduce((a, r) => a + Math.max(0, r.incoming), 0);
+  const waiting = rows.filter((r) => r.arrival === 'not arrived');
+  const partly = rows.filter((r) => r.arrival === 'partly arrived');
+  const waitingUnits = waiting.reduce((a, r) => a + Math.max(0, r.outstanding || r.ordered), 0);
 
   view().innerHTML = `
     <div class="page-head">
@@ -3126,6 +3296,10 @@ async function viewStock() {
       <div class="tile tile-out"><div class="tile-top"><span class="tile-dot"></span>Incoming</div>
         <div class="tile-val">${n(incoming)}<span class="tile-cur">units ordered, not received</span></div>
         <div class="tile-sub"><span><b>${rows.filter((r) => r.incoming > 0).length}</b> items on the way</span></div></div>
+      <div class="tile tile-wait"><div class="tile-top"><span class="tile-dot"></span>Not arrived</div>
+        <div class="tile-val">${n(waitingUnits)}<span class="tile-cur">units still to come</span></div>
+        <div class="tile-sub"><span><b>${waiting.length}</b> items not arrived${partly.length
+          ? `, <b>${partly.length}</b> partly` : ''}</span></div></div>
     </div>
     <div class="card">
       <div class="card-head">
@@ -3137,6 +3311,9 @@ async function viewStock() {
             <option value="all">Show all</option>
             <option value="in">In stock</option>
             <option value="incoming">Incoming</option>
+            <option value="notarrived">Not arrived</option>
+            <option value="partly">Partly arrived</option>
+            <option value="notcounted">Not counted yet</option>
           </select>
         </div>
       </div>
@@ -3149,6 +3326,9 @@ async function viewStock() {
     const shown = rows.filter((r) => {
       if (f === 'in' && !(r.onHand > 0)) return false;
       if (f === 'incoming' && !(r.incoming > 0)) return false;
+      if (f === 'notarrived' && r.arrival !== 'not arrived') return false;
+      if (f === 'partly' && r.arrival !== 'partly arrived') return false;
+      if (f === 'notcounted' && r.arrival !== 'not counted') return false;
       return matchAny(q, [r.sku, r.brand, r.description, r.party_uids, r.party_names,
         r.suppliers.join(' '), r.invoiceNos.join(' '),
         r.from.map((d) => d.reference).join(' ')]);
@@ -3161,6 +3341,7 @@ async function viewStock() {
         <thead><tr>
           <th>Model (SKU)</th><th>Brand</th><th>Description</th>
           <th>Supplier</th><th>Invoice no</th><th>Order</th><th>Account</th>
+          <th>Arrived?</th>
           <th class="r">Ordered</th><th class="r">Received</th><th class="r">Delivered</th>
           <th class="r">On hand</th><th class="r">Incoming</th>
         </tr></thead>
@@ -3176,6 +3357,7 @@ async function viewStock() {
               : '<span class="dim">—</span>'}</td>
             <td>${String(r.party_uids || '').split(',').filter(Boolean)
               .map((u) => `<span class="uid-chip">${esc(u)}</span>`).join(' ')}</td>
+            <td>${arrivalChip(r)}</td>
             <td class="r">${n(r.ordered)}</td>
             <td class="r">${n(r.received)}</td>
             <td class="r">${n(r.delivered)}</td>

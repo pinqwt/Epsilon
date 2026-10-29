@@ -239,6 +239,9 @@ textarea { resize: vertical; min-height: 62px; }
 .notice { border-radius: var(--radius); padding: 12px 14px; font-size: 13.5px; line-height: 1.5; }
 .notice-info { background: var(--brand-wash); box-shadow: inset 2px 0 0 var(--brand); }
 .notice-warn { background: var(--part-wash); box-shadow: inset 2px 0 0 var(--part); }
+/* A likely mistake, not just something to note: a duplicated bill, a zero
+ * total, an invoice well out of step with the item list. */
+.notice-err { background: var(--due-wash); box-shadow: inset 2px 0 0 var(--due); }
 
 .dropzone {
   border: 1px dashed var(--rule-2); border-radius: var(--radius);
@@ -743,6 +746,20 @@ a.uid-chip:hover { text-decoration: underline; }
 .ov-tiles { margin-bottom: 18px; }
 .stock-low { color: var(--due); font-weight: 600; }
 .stock-ok { color: var(--settled); font-weight: 600; }
+
+/* Did it turn up? "Not counted" is deliberately grey, not red: nobody has
+ * recorded a goods receipt, which is not the same as the goods being missing.
+ */
+.arr-chip {
+  display: inline-block; padding: 1px 9px; border-radius: 999px;
+  white-space: nowrap; font-weight: 600; font-size: 0.86rem;
+}
+.arr-ok { background: var(--settled-wash); color: var(--settled); }
+.arr-part { background: var(--part-wash); color: var(--part); }
+.arr-bad { background: var(--due-wash); color: var(--due); }
+.arr-none { background: var(--surface-2); color: var(--text-dim); }
+.arr-note { font-size: 0.78rem; color: var(--text-dim); margin-top: 2px; }
+.tile-wait .tile-dot { background: var(--due); }
 .table-tools { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .table-tools input[type=search] { width: 220px; }
 .row-acct .uid-chip { justify-self: start; }

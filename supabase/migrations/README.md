@@ -26,6 +26,14 @@ The ERP build described in `Software_Sequence_Charts_With_Module_Screens.pdf`
 | | `erp_phase5_settlement_with_exchange_difference` | 20261029083832 |
 | | `erp_phase5_reversal_fx_conversion_and_trial_balance` | 20261029091037 |
 | | `erp_phase5_fix_reversed_journals_stay_in_ledger` | 20261029091306 |
+| `erp_phase2_purchase_path.sql` | `erp_phase2_goods_receipts` | 20261029121* |
+| | `erp_phase2_landed_costs` | |
+| | `erp_phase2_rls_policies` | |
+| | `erp_phase2_post_goods_receipt` | |
+| | `erp_phase2_order_progress_and_stock_on_hand` | |
+| | `erp_phase2_cancel_posted_goods_receipt` | |
+| | `erp_phase2_cancel_receipt_permission_fix` | |
+| | `erp_phase2_allocate_landed_cost` | |
 
 Each file was applied as several migrations because the tool rejects very large
 statements; the files group them by purpose. They match the deployed state, including
