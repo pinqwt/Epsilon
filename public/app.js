@@ -3178,7 +3178,9 @@ function arrivalChip(r) {
       + '<div class="arr-note">ordered, nothing received yet</div>';
   }
   return '<span class="arr-chip arr-none">Not counted</span>'
-    + '<div class="arr-note">no goods receipt recorded</div>';
+    + `<div class="arr-note">${r.shipped
+      ? 'booked as a shipment, units never counted'
+      : 'no goods receipt recorded'}</div>`;
 }
 
 /* Worked out from the orders: what purchases brought in (as each order's
@@ -3244,6 +3246,20 @@ async function viewStock() {
     arrivals.filter((a) => (Number(a.qty_received) || 0) > 0 || (Number(a.qty_accepted) || 0) > 0)
       .map((a) => String(a.item_label || '').trim().toLowerCase()));
 
+  /* Goods booked under the older flow arrived as a shipment, which recorded
+   * their value but never counted the units. Those are "not counted", not
+   * "not arrived" — calling them missing would be plainly wrong. Only an
+   * order with no shipment and no receipt has really had nothing turn up.
+   */
+  const shippedKeys = new Set();
+  for (const it of lines) {
+    const d = dealById.get(it.deal_id);
+    if (!d || d.direction !== 'sending') continue;
+    if (!(Number(d.goods_value) > 0)) continue;
+    const k = keyOf(it);
+    if (k) shippedKeys.add(k);
+  }
+
   const rows = stock.map((r) => {
     const received = Number(r.received), delivered = Number(r.delivered);
     const from = [...(byKey.get(r.stock_key) || new Map()).values()];
@@ -3255,7 +3271,7 @@ async function viewStock() {
       else if (arr.accepted > 0) arrival = 'partly arrived';
       else if (arr.damaged > 0) arrival = 'arrived damaged';
       else arrival = 'not arrived';
-    } else if (arr && arr.ordered > 0) {
+    } else if (arr && arr.ordered > 0 && !shippedKeys.has(r.stock_key)) {
       arrival = 'not arrived';
     }
     return {
@@ -3268,6 +3284,7 @@ async function viewStock() {
       invoiceNos: [...new Set(from.flatMap((d) => invoiceNos.get(d.id) || []))],
       arrival,
       counted,
+      shipped: shippedKeys.has(r.stock_key),
       accepted: arr ? arr.accepted : 0,
       outstanding: arr ? arr.outstanding : 0,
       damaged: arr ? arr.damaged : 0,
