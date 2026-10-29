@@ -767,6 +767,19 @@ a.uid-chip:hover { text-decoration: underline; }
   font-weight: 600; font-size: 0.86rem; white-space: nowrap;
   background: var(--surface-2); color: var(--text-dim);
 }
+/* Goods receipts: a draft is still yours to change, a posted one is not. */
+.grn-chip {
+  display: inline-block; padding: 1px 9px; border-radius: 999px;
+  font-weight: 600; font-size: 0.86rem; white-space: nowrap;
+  background: var(--surface-2); color: var(--text-dim);
+}
+.grn-posted { background: var(--settled-wash); color: var(--settled); }
+.grn-cancelled { background: var(--due-wash); color: var(--due); }
+
+/* Counting goods in: narrow number boxes, so a row of them stays readable. */
+.qty-in { width: 76px; text-align: right; }
+.qty-cost { width: 104px; }
+
 .hist-deleted, .hist-cancelled { background: var(--due-wash); color: var(--due); }
 .hist-reversed { background: var(--part-wash); color: var(--part); }
 .hist-posted, .hist-restored, .hist-approved { background: var(--settled-wash); color: var(--settled); }

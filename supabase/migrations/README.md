@@ -36,6 +36,9 @@ The ERP build described in `Software_Sequence_Charts_With_Module_Screens.pdf`
 | | `erp_phase2_allocate_landed_cost` | |
 | `erp_activity_log_with_usernames.sql` | `erp_activity_log_with_usernames` | 20261029120328 |
 | `erp_views_security_invoker.sql` | `erp_views_security_invoker` | 20261029* |
+| `erp_phase2_only_drafts_are_editable.sql` | `erp_phase2_receipts_only_drafts_editable` | 20261029* |
+| | `erp_phase2_receipt_lines_only_drafts_editable` | |
+| | `erp_phase2_landed_costs_only_drafts_editable` | |
 
 Each file was applied as several migrations because the tool rejects very large
 statements; the files group them by purpose. They match the deployed state, including

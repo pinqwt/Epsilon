@@ -319,6 +319,9 @@ async function callUsersFn(payload) {
   return body;
 }
 
+// There is one company and one warehouse; looked up once, then remembered.
+let _erpDefaults = null;
+
 const api = {
   async totals() {
     const { data, error } = await sb.rpc('ledger_totals');
@@ -531,6 +534,104 @@ const api = {
     const { data, error } = await q;
     if (error) throw error;
     return data || [];
+  },
+
+  /* The company and warehouse a receipt is booked against. There is one of
+   * each, so nothing is asked of the user; this just finds them once.
+   */
+  async erpDefaults() {
+    if (_erpDefaults) return _erpDefaults;
+    const [co, wh] = await Promise.all([
+      sb.from('companies').select('id, code, base_currency').limit(1).maybeSingle(),
+      sb.from('warehouses').select('id, code').limit(1).maybeSingle(),
+    ]);
+    if (co.error) throw co.error;
+    if (wh.error) throw wh.error;
+    if (!co.data || !wh.data) {
+      throw new Error('No company or warehouse is set up yet, so goods cannot be received.');
+    }
+    _erpDefaults = { company: co.data, warehouse: wh.data };
+    return _erpDefaults;
+  },
+
+  /* Every goods receipt raised against one order, newest first, each with its
+   * counted lines.
+   */
+  async receipts(dealId) {
+    const { data, error } = await sb.from('goods_receipts')
+      .select('*, lines:goods_receipt_lines(*)')
+      .eq('deal_id', dealId)
+      .order('received_on', { ascending: false })
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    return data || [];
+  },
+
+  /* Save a draft: the header, then its lines written fresh. Lines are replaced
+   * rather than patched because the dialog always sends the whole count.
+   */
+  async saveReceipt(head, lines) {
+    const { company, warehouse } = await api.erpDefaults();
+    let id = head.id;
+    if (id) {
+      const { error } = await sb.from('goods_receipts').update({
+        received_on: head.received_on,
+        note: head.note || '',
+        inspection_status: head.inspection_status || 'awaiting',
+      }).eq('id', id);
+      if (error) throw error;
+      const del = await sb.from('goods_receipt_lines').delete().eq('receipt_id', id);
+      if (del.error) throw del.error;
+    } else {
+      const { data: { user } } = await sb.auth.getUser();
+      const { data, error } = await sb.from('goods_receipts').insert({
+        company_id: company.id,
+        warehouse_id: warehouse.id,
+        deal_id: head.deal_id,
+        received_on: head.received_on,
+        note: head.note || '',
+        inspection_status: head.inspection_status || 'awaiting',
+        created_by: user?.id || null,
+      }).select('id').single();
+      if (error) throw error;
+      id = data.id;
+    }
+    const rows = lines.map((l) => ({
+      receipt_id: id,
+      deal_item_id: l.deal_item_id,
+      item_id: l.item_id || null,
+      qty_expected: l.qty_expected,
+      qty_received: l.qty_received,
+      qty_accepted: l.qty_accepted,
+      qty_damaged: l.qty_damaged,
+      unit_cost: l.unit_cost,
+      note: l.note || '',
+    }));
+    if (rows.length) {
+      const { error } = await sb.from('goods_receipt_lines').insert(rows);
+      if (error) throw error;
+    }
+    return id;
+  },
+
+  /* A draft has booked nothing, so it really is deleted. A posted one cannot
+   * be, which is why the UI offers Cancel instead.
+   */
+  async deleteReceipt(id) {
+    const { error } = await sb.from('goods_receipts').delete().eq('id', id);
+    if (error) throw error;
+  },
+
+  async postReceipt(id) {
+    const { error } = await sb.rpc('post_goods_receipt', { p_receipt: id });
+    if (error) throw error;
+  },
+
+  async cancelReceipt(id, reason) {
+    const { error } = await sb.rpc('cancel_goods_receipt', {
+      p_receipt: id, p_reason: reason || '',
+    });
+    if (error) throw error;
   },
 
   /* Is this invoice number already on file? The same number arriving twice is
@@ -1885,6 +1986,18 @@ async function viewDeal(id) {
       </div>
     </div>
 
+    ${d.direction === 'sending' ? `
+    <div class="card">
+      <div class="card-head">
+        <h3>Goods received</h3>
+        <div class="spacer"></div>
+        ${canEdit() ? '<button class="btn btn-sm" data-act="new-receipt" type="button">Receive goods</button>' : ''}
+      </div>
+      <div class="card-body tight" id="dl-receipts">
+        <div class="empty">Loading…</div>
+      </div>
+    </div>` : ''}
+
     <div class="card">
       <div class="card-head">
         <h3>History</h3>
@@ -1900,7 +2013,301 @@ async function viewDeal(id) {
   for (const a of $$("[data-nav]")) a.classList.toggle("is-active", a.dataset.nav === d.direction);
 
   paintHistory(d);
+  if (d.direction === 'sending') paintReceipts(d, items);
   wireDealActions(d, invoices);
+}
+
+/* ------------------------- goods receipts (UI) ------------------------- */
+
+// A draft keeps the plain grey of .grn-chip; the other two colour it.
+const GRN_STATUS = {
+  draft: ['Draft', ''],
+  posted: ['Posted', 'grn-posted'],
+  cancelled: ['Cancelled', 'grn-cancelled'],
+};
+
+/* What was counted in on one order. A draft can still be edited or deleted
+ * outright; a posted one can only be cancelled, which takes the stock back
+ * out and reverses its journal rather than pretending it never happened.
+ */
+async function paintReceipts(d, items) {
+  const box = $('#dl-receipts');
+  if (!box) return;
+  let rows = [];
+  try {
+    rows = await api.receipts(d.id);
+  } catch (e) {
+    box.innerHTML = `<div class="empty">${esc(errText(e))}</div>`;
+    return;
+  }
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty">Nothing counted in yet.${
+      canEdit() ? ' Use <strong>Receive goods</strong> when the shipment arrives.' : ''
+    }</div>`;
+    return;
+  }
+
+  const dec = d.cur_decimals;
+  box.innerHTML = `
+    <div class="table-scroll"><table class="data">
+      <thead><tr>
+        <th>Receipt</th><th>Received</th><th>Items</th>
+        <th class="r">Accepted</th><th class="r">Damaged</th><th class="r">Value</th>
+        <th>Status</th>${canEdit() ? '<th></th>' : ''}
+      </tr></thead>
+      <tbody>
+        ${rows.map((r) => {
+          const ls = r.lines || [];
+          const acc = ls.reduce((s, l) => s + Number(l.qty_accepted || 0), 0);
+          const dmg = ls.reduce((s, l) => s + Number(l.qty_damaged || 0), 0);
+          const val = ls.reduce((s, l) => s + Number(l.qty_accepted || 0) * Number(l.unit_cost || 0), 0);
+          const [label, cls] = GRN_STATUS[r.status] || [r.status, ''];
+          return `<tr>
+            <td>${esc(r.doc_no || '—')}${
+              r.status === 'cancelled' && r.cancel_reason
+                ? `<div class="dim" style="font-size:12px">${esc(r.cancel_reason)}</div>` : ''}</td>
+            <td>${esc(dateLabel(r.received_on))}</td>
+            <td>${ls.length}</td>
+            <td class="r">${fmt(acc, null, 0)}</td>
+            <td class="r">${dmg ? fmt(dmg, null, 0) : '<span class="dim">—</span>'}</td>
+            <td class="r">${fmt(val, d.currency, dec)}</td>
+            <td><span class="grn-chip ${cls}">${esc(label)}</span>${
+              r.status === 'draft' && r.inspection_status !== 'approved'
+                ? '<div class="dim" style="font-size:12px">inspection not approved</div>' : ''}</td>
+            ${canEdit() ? `<td class="act">${receiptActions(r)}</td>` : ''}
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>
+    <p class="preview-note" style="padding:10px 12px;margin:0">A draft can be edited or deleted. Once posted it has moved stock and money, so deleting it cancels it instead — the record stays and its effect is reversed.</p>`;
+
+  box.onclick = async (e) => {
+    const btn = e.target.closest('button[data-grn]');
+    if (!btn) return;
+    const id = btn.dataset.id;
+    const r = rows.find((x) => x.id === id);
+    const act = btn.dataset.grn;
+    btn.disabled = true;
+    try {
+      if (act === 'edit') { await receiptDialog(d, items, r); return; }
+      if (act === 'post') {
+        if (!await confirmAction(
+          'Post this receipt? It adds the accepted goods to stock at their landed cost and writes the journal.',
+          'Post')) return;
+        await api.postReceipt(id);
+        toast('Receipt posted — stock updated', 'ok');
+        return viewDeal(d.id);
+      }
+      if (act === 'delete') {
+        if (!await confirmAction('Delete this draft receipt? Nothing has been booked yet.', 'Delete')) return;
+        await api.deleteReceipt(id);
+        toast('Draft deleted', 'ok');
+        return viewDeal(d.id);
+      }
+      if (act === 'cancel') {
+        const reason = await askReason(
+          'Cancelling takes the goods back out of stock, unwinds the average cost and reverses the journal. The receipt stays on file showing who cancelled it and why.');
+        if (reason === null) return;
+        await api.cancelReceipt(id, reason);
+        toast('Receipt cancelled and reversed', 'ok');
+        return viewDeal(d.id);
+      }
+    } catch (err) {
+      toast(errText(err), 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+function receiptActions(r) {
+  if (r.status === 'draft') {
+    return `<button class="btn btn-ghost btn-sm" data-grn="edit" data-id="${r.id}" type="button">Edit</button>
+            <button class="btn btn-sm" data-grn="post" data-id="${r.id}" type="button">Post</button>
+            <button class="btn btn-ghost btn-sm" data-grn="delete" data-id="${r.id}" type="button">✕</button>`;
+  }
+  if (r.status === 'posted') {
+    return `<button class="btn btn-ghost btn-sm" data-grn="cancel" data-id="${r.id}" type="button">Delete</button>`;
+  }
+  return '';
+}
+
+/* Count the goods in. One row per order line, pre-filled with what is still
+ * outstanding, because the common case is "it all turned up". Accepted is
+ * what becomes sellable stock; damaged is counted but kept out of it.
+ */
+async function receiptDialog(d, items, existing) {
+  const dec = d.cur_decimals;
+  const byItem = new Map((existing?.lines || []).map((l) => [l.deal_item_id, l]));
+  const today = new Date().toISOString().slice(0, 10);
+
+  const rows = items.map((it) => {
+    const prev = byItem.get(it.id);
+    const ordered = Number(it.qty || 0);
+    const already = Number(it.qty_accepted || 0);
+    const outstanding = Math.max(ordered - already, 0);
+    return {
+      deal_item_id: it.id,
+      item_id: it.item_id || null,
+      label: (it.model || '').trim() || it.description || '—',
+      brand: it.brand || '',
+      ordered,
+      already,
+      outstanding,
+      received: prev ? Number(prev.qty_received) : outstanding,
+      accepted: prev ? Number(prev.qty_accepted) : outstanding,
+      damaged: prev ? Number(prev.qty_damaged) : 0,
+      cost: prev ? Number(prev.unit_cost) : Number(it.unit_price || 0),
+    };
+  });
+
+  const m = openModal({
+    title: existing ? 'Edit goods receipt' : 'Receive goods',
+    width: '860px',
+    body: `
+      <div class="grid-form">
+        <label class="field"><span>Received on</span>
+          <input id="grn-date" type="date" value="${esc(existing?.received_on || today)}">
+        </label>
+        <label class="field"><span>Inspection</span>
+          <select id="grn-insp">
+            <option value="awaiting">Not checked yet</option>
+            <option value="approved">Approved — fit to sell</option>
+            <option value="rejected">Rejected</option>
+          </select>
+        </label>
+        <label class="field wide"><span>Note <em>(optional)</em></span>
+          <input id="grn-note" type="text" maxlength="200" value="${esc(existing?.note || '')}"
+                 placeholder="container number, who checked it">
+        </label>
+      </div>
+      <div class="table-scroll" style="margin-top:14px"><table class="data">
+        <thead><tr>
+          <th>Item</th><th class="r">Ordered</th><th class="r">Still due</th>
+          <th class="r">Arrived</th><th class="r">Good</th><th class="r">Damaged</th>
+          <th class="r">Unit cost</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map((r, i) => `<tr data-i="${i}">
+            <td>${esc(r.label)}${r.brand ? `<div class="dim" style="font-size:12px">${esc(r.brand)}</div>` : ''}</td>
+            <td class="r">${fmt(r.ordered, null, 0)}</td>
+            <td class="r">${fmt(r.outstanding, null, 0)}</td>
+            <td class="r"><input class="qty-in" data-f="received" type="number" min="0" step="any" value="${r.received}"></td>
+            <td class="r"><input class="qty-in" data-f="accepted" type="number" min="0" step="any" value="${r.accepted}"></td>
+            <td class="r"><input class="qty-in" data-f="damaged"  type="number" min="0" step="any" value="${r.damaged}"></td>
+            <td class="r"><input class="qty-in qty-cost" data-f="cost" type="number" min="0" step="any" value="${r.cost}"></td>
+          </tr>`).join('')}
+        </tbody>
+      </table></div>
+      <div id="grn-problem"></div>
+      <p class="preview-note" style="margin:10px 0 0">Only <strong>good</strong> units become stock you can sell. Damaged ones are counted so the order shows as settled, but stay out of stock.</p>`,
+    foot: `<button class="btn" data-close type="button">Cancel</button>
+           <button class="btn btn-primary" data-save type="button">${existing ? 'Save draft' : 'Save draft'}</button>`,
+  });
+
+  m.querySelector('#grn-insp').value = existing?.inspection_status || 'awaiting';
+
+  const read = () => rows.map((r, i) => {
+    const tr = m.querySelector(`tr[data-i="${i}"]`);
+    const num = (f) => Math.max(Number(tr.querySelector(`[data-f="${f}"]`).value) || 0, 0);
+    return {
+      deal_item_id: r.deal_item_id,
+      item_id: r.item_id,
+      qty_expected: r.outstanding,
+      qty_received: num('received'),
+      qty_accepted: num('accepted'),
+      qty_damaged: num('damaged'),
+      unit_cost: num('cost'),
+      label: r.label,
+      outstanding: r.outstanding,
+    };
+  });
+
+  /* Catch the mistakes the database would refuse anyway, but say them in
+   * words and before the user loses the form. */
+  const check = (ls) => {
+    const bad = [];
+    for (const l of ls) {
+      if (l.qty_accepted + l.qty_damaged > l.qty_received) {
+        bad.push(`${l.label}: good + damaged is more than arrived.`);
+      }
+      if (l.qty_received > l.outstanding && l.outstanding > 0) {
+        bad.push(`${l.label}: ${fmt(l.qty_received, null, 0)} arrived but only ${fmt(l.outstanding, null, 0)} still due.`);
+      }
+      if (l.qty_accepted > 0 && l.unit_cost <= 0) {
+        bad.push(`${l.label}: accepted with no unit cost, so it cannot be valued.`);
+      }
+    }
+    return bad;
+  };
+
+  const problem = m.querySelector('#grn-problem');
+  const paint = () => {
+    const bad = check(read());
+    problem.innerHTML = bad.length
+      ? `<div class="notice-err"><strong>Check this before saving</strong><ul style="margin:6px 0 0 18px">${
+          bad.map((b) => `<li>${esc(b)}</li>`).join('')}</ul></div>`
+      : '';
+    return bad;
+  };
+  m.querySelectorAll('.qty-in').forEach((el) => { el.oninput = paint; });
+  paint();
+
+  m.querySelector('[data-save]').onclick = async (e) => {
+    const bad = paint();
+    if (bad.length) { toast('Fix the highlighted lines first', 'err'); return; }
+    const ls = read().filter((l) => l.qty_received > 0 || l.qty_accepted > 0 || l.qty_damaged > 0);
+    if (!ls.length) { toast('Nothing counted in — enter what arrived', 'err'); return; }
+    e.target.disabled = true;
+    try {
+      await api.saveReceipt({
+        id: existing?.id,
+        deal_id: d.id,
+        received_on: m.querySelector('#grn-date').value || today,
+        note: m.querySelector('#grn-note').value.trim(),
+        inspection_status: m.querySelector('#grn-insp').value,
+      }, ls);
+      closeModal();
+      toast(existing ? 'Draft saved' : 'Draft receipt saved — post it when you are happy', 'ok');
+      await viewDeal(d.id);
+    } catch (err) {
+      toast(errText(err), 'err');
+      e.target.disabled = false;
+    }
+  };
+}
+
+/* A delete that leaves a trace needs a reason, so the History card can say
+ * why as well as who.
+ */
+function askReason(message) {
+  return new Promise((resolve) => {
+    const m = openModal({
+      title: 'Why are you deleting this?',
+      body: `<p style="margin:0 0 10px">${esc(message)}</p>
+             <label class="field"><span>Reason</span>
+               <input id="rsn" type="text" maxlength="200" placeholder="e.g. counted wrong, supplier took it back">
+             </label>`,
+      foot: `<button class="btn" data-close type="button">Keep it</button>
+             <button class="btn btn-danger" data-go type="button">Delete</button>`,
+      width: '480px',
+    });
+    let done = false;
+    const input = m.querySelector('#rsn');
+    input.focus();
+    const go = () => {
+      const v = input.value.trim();
+      if (!v) { input.focus(); return; }
+      done = true; closeModal(); resolve(v);
+    };
+    m.querySelector('[data-go]').onclick = go;
+    input.onkeydown = (e) => { if (e.key === 'Enter') go(); };
+    const root = $('#modal-root');
+    const obs = new MutationObserver(() => {
+      if (root.hidden) { obs.disconnect(); if (!done) resolve(null); }
+    });
+    obs.observe(root, { attributes: true, attributeFilter: ['hidden'] });
+  });
 }
 
 /* The audit trail for one record, by name. Nothing here can be edited — it is
@@ -1996,6 +2403,14 @@ function wireDealActions(d, invoices) {
       }
       if (act === 'restore-deal') {
         await api.restoreDeal(d.id); toast('Restored', 'ok'); return reload();
+      }
+      if (act === 'new-receipt') {
+        const { items } = await api.deal(d.id);
+        if (!items.length) {
+          toast('Add the order items first — there is nothing to count in', 'err');
+          return;
+        }
+        return receiptDialog(d, items);
       }
       if (act === 'purge-deal') {
         if (!await confirmAction(
