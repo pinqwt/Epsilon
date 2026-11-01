@@ -39,6 +39,12 @@ The ERP build described in `Software_Sequence_Charts_With_Module_Screens.pdf`
 | `erp_phase2_only_drafts_are_editable.sql` | `erp_phase2_receipts_only_drafts_editable` | 20261029* |
 | | `erp_phase2_receipt_lines_only_drafts_editable` | |
 | | `erp_phase2_landed_costs_only_drafts_editable` | |
+| `erp_phase3_sales_path.sql` | `erp_phase3_sales_tables` | 20261101* |
+| | `erp_phase3_sales_views` | |
+| | `erp_phase3_sales_order_functions` | |
+| | `erp_phase3_delivery_functions` | |
+| | `erp_phase3_invoice_and_credit_note_functions` | |
+| | `erp_phase3_open_items_count_credit_notes` | |
 
 Each file was applied as several migrations because the tool rejects very large
 statements; the files group them by purpose. They match the deployed state, including
