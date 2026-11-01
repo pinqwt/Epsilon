@@ -448,6 +448,18 @@ const api = {
    * or came from an earlier invoice, and a thinner line on a later invoice
    * should not wipe it. Returns which fields were actually filled in.
    */
+  /* Give this account its supplier number, or hand back the one it already
+   * has. Safe to call twice: the database reuses what is on file rather than
+   * issuing a second number. */
+  async ensureSupplierNo(partyId, claim) {
+    if (!partyId) return null;
+    const { data, error } = await sb.rpc('ensure_supplier_no', {
+      p_party: partyId, p_claim: String(claim || '').trim() || null,
+    });
+    if (error) throw error;
+    return data;
+  },
+
   async savePartyDetails(partyId, { supplier_no, details }) {
     if (!partyId) return [];
     const { data: party, error: readErr } = await sb.from('parties')
@@ -1100,15 +1112,25 @@ function sheetInfo(items) {
 async function saveSheetInfo(deal, info, invoices = []) {
   const done = [];
 
-  if (info.party_no || info.party_details) {
+  /* A supplier account always ends up numbered, whether or not the sheet
+   * carried one — that is what stops a second number turning up later. The
+   * database keeps any number already on file, so this cannot renumber an
+   * account that is already trading.
+   */
+  if (deal.party_id && deal.direction === 'sending') {
+    try {
+      const no = await api.ensureSupplierNo(deal.party_id, info.party_no);
+      if (no) done.push(`supplier number ${no}`);
+    } catch {
+      // Numbering must never cost the order the items that came with it.
+    }
+  }
+
+  if (info.party_details) {
     const filled = await api.savePartyDetails(deal.party_id, {
-      supplier_no: info.party_no,
       details: info.party_details,
     });
-    if (filled.length) {
-      done.push(`${filled.includes('supplier_no') ? 'supplier number' : ''}${
-        filled.length === 2 ? ' and ' : ''}${filled.includes('details') ? 'contact details' : ''} saved to the account`);
-    }
+    if (filled.includes('details')) done.push('contact details saved to the account');
   }
 
   /* A recorded invoice total becomes the bill, so an invoice is only put on
@@ -1437,6 +1459,43 @@ function partyScore(a, b) {
 }
 
 /** The existing account this name most likely is, or null when none is close (or two are equally close). */
+/* The supplier number is the account number WE give a supplier, not a code
+ * they print — none of the real invoices carries one, so in practice the
+ * column arrives blank and the app has to settle it.
+ *
+ * One supplier holds one number, ever. So: a number already on the account
+ * always wins, because a mistyped cell in one spreadsheet must never
+ * renumber a supplier already being traded with. A number the sheet claims
+ * is only taken up by an account that has none. A genuinely new supplier is
+ * left unnumbered here and numbered by the database when the record is
+ * saved, so previewing a file that is then cancelled does not burn a code.
+ */
+function resolveSupplierNo(name, claimed, parties) {
+  const want = String(claimed || '').trim();
+  const hit = name ? matchParty(name, parties) : null;
+  const party = hit?.party || null;
+  const onFile = String(party?.supplier_no || party?.sup_code || '').trim();
+  const same = (a, b) => a.toLowerCase() === b.toLowerCase();
+
+  if (onFile) {
+    return {
+      number: onFile,
+      party,
+      source: 'account',
+      // Worth saying out loud: we are keeping one and ignoring the other.
+      conflict: want && !same(want, onFile) ? want : null,
+    };
+  }
+  if (want) {
+    const taken = parties.find((p) => same(String(p.supplier_no || '').trim(), want));
+    if (taken) {
+      return { number: null, party, source: 'taken', takenBy: taken.name, conflict: want };
+    }
+    return { number: want, party, source: 'invoice', conflict: null };
+  }
+  return { number: null, party, source: 'new', conflict: null };
+}
+
 function matchParty(name, parties) {
   const scored = parties.map((p) => ({ party: p, score: partyScore(name, p.name) }))
     .filter((r) => r.score >= 0.6).sort((a, b) => b.score - a.score);
@@ -1734,6 +1793,8 @@ async function viewNewDeal(direction) {
   const dir = DIR[direction];
   let pending = [];
   let sheet = {};   // invoice number and party details read off the imported file
+  // Which supplier number this import lands on, and how it got there.
+  let supno = { number: null, party: null, source: 'new', conflict: null };
 
   view().innerHTML = `
     <div class="page-head">
@@ -1844,20 +1905,49 @@ async function viewNewDeal(direction) {
       createBtn.textContent = n ? `Create ${noun} with ${n} item${n === 1 ? '' : 's'}` : `Create ${noun}`;
     }
     $('#pending-preview').innerHTML = pending.length
-      ? `<div class="table-scroll preview-scroll" style="margin-top:14px"><table class="data">
-           <thead><tr><th>Name</th><th>Brand</th><th>Model (SKU)</th><th>Description</th><th class="r">Qty</th><th class="r">Price</th><th class="r">Amount</th></tr></thead>
+      ? `${supplierNote()}
+         <div class="table-scroll preview-scroll" style="margin-top:14px"><table class="data">
+           <thead><tr><th>Name</th><th>Supplier no.</th><th>Brand</th><th>Model (SKU)</th><th>Description</th><th class="r">Qty</th><th class="r">Price</th><th class="r">Amount</th></tr></thead>
            <tbody>${pending.map((it) => `<tr>
              <td>${esc(it.party_name)}</td>
+             <td class="sku">${supno.number
+               ? esc(supno.number)
+               : '<span class="dim">on save</span>'}</td>
              <td>${esc(it.brand)}</td><td class="sku">${esc(it.model)}</td>
              <td class="desc">${esc(it.description)}</td>
              <td class="r">${qty(it.qty)}</td><td class="r">${fmt(it.unit_price, null, 2)}</td>
              <td class="r">${fmt(it.qty * it.unit_price, null, 2)}</td></tr>`).join('')}</tbody>
            <tfoot><tr>
-             <td colspan="6" class="r">Total of ${pending.length} item${pending.length === 1 ? '' : 's'}</td>
+             <td colspan="7" class="r">Total of ${pending.length} item${pending.length === 1 ? '' : 's'}</td>
              <td class="r">${fmt(pending.reduce((a, it) => a + it.qty * it.unit_price, 0), null, 2)}</td>
            </tr></tfoot>
          </table></div>`
       : '';
+  };
+
+  /* Say which number the import settled on and why, because the quiet cases
+   * are the ones worth seeing: an existing account being reused, or a number
+   * in the sheet being ignored in favour of the one on file.
+   */
+  const supplierNote = () => {
+    if (supno.conflict && supno.source === 'taken') {
+      return `<div class="notice-warn"><strong>Supplier number ${esc(supno.conflict)} belongs to ${
+        esc(supno.takenBy)}.</strong> It will not be reused — this supplier gets their own number when you save.</div>`;
+    }
+    if (supno.conflict) {
+      return `<div class="notice-warn"><strong>This sheet says ${esc(supno.conflict)}, but ${
+        esc(supno.party?.name || 'this supplier')} is already ${esc(supno.number)}.</strong>
+        Keeping ${esc(supno.number)} — one supplier only ever holds one number. Change it in <em>Edit details</em> on the account if the sheet is right.</div>`;
+    }
+    if (supno.source === 'account') {
+      return `<p class="preview-note" style="margin:0">Existing account <strong>${
+        esc(supno.party?.name || '')}</strong> — supplier number ${esc(supno.number)}.</p>`;
+    }
+    if (supno.source === 'invoice') {
+      return `<p class="preview-note" style="margin:0">Supplier number ${
+        esc(supno.number)} taken from the sheet.</p>`;
+    }
+    return `<p class="preview-note" style="margin:0">New supplier — a number is assigned when you save, so no two accounts can share one.</p>`;
   };
 
   // A supplier invoice: read who it is from, and reuse their existing account so no duplicate is made.
@@ -1885,6 +1975,14 @@ async function viewNewDeal(direction) {
     if (got) {
       pending = got.items;
       sheet = got.info;
+      // Settle the supplier number before showing the list, so the preview
+      // says which account this is going to rather than leaving it to save.
+      try {
+        const { parties } = await api.parties();
+        supno = resolveSupplierNo(sheet.party_name, sheet.party_no, parties);
+      } catch {
+        supno = { number: sheet.party_no || null, party: null, source: sheet.party_no ? 'invoice' : 'new', conflict: null };
+      }
       showPending();
       // The invoice columns tell us who the record is with and which invoice it
       // is, so those are filled in rather than retyped. They stay editable.
@@ -1933,6 +2031,9 @@ async function viewNewDeal(direction) {
       // order. What is typed into the form wins over what the file said.
       const info = {
         ...sheet,
+        // Only a number the account can actually take: one already belonging
+        // to someone else was rejected at preview and must not arrive here.
+        party_no: supno.source === 'taken' ? '' : (supno.number || sheet.party_no || ''),
         invoice_no: String(f.get('invoice_no') || '').trim() || sheet.invoice_no || '',
         total: pending.reduce((a, it) => a + it.qty * it.unit_price, 0),
       };

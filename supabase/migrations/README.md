@@ -45,6 +45,7 @@ The ERP build described in `Software_Sequence_Charts_With_Module_Screens.pdf`
 | | `erp_phase3_delivery_functions` | |
 | | `erp_phase3_invoice_and_credit_note_functions` | |
 | | `erp_phase3_open_items_count_credit_notes` | |
+| `supplier_no_is_the_account_number.sql` | `supplier_no_is_the_account_number` | 20261101* |
 
 Each file was applied as several migrations because the tool rejects very large
 statements; the files group them by purpose. They match the deployed state, including

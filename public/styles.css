@@ -596,7 +596,7 @@ table.data tfoot tr:last-child td { font-weight: 600; color: var(--ink); font-si
 
 /* Keep the columns at a readable width and scroll sideways instead of crushing
    Description until Qty, Price and Amount have nowhere left to go. */
-.preview-scroll > table.data { min-width: 760px; }
+.preview-scroll > table.data { min-width: 860px; }
 .preview-scroll td.desc { min-width: 240px; }
 .preview-scroll thead th {
   position: sticky; top: 0; z-index: 1;
