@@ -634,6 +634,228 @@ const api = {
     if (error) throw error;
   },
 
+  /* ----------------------- the sales path (phase 3) ----------------------
+   * Approving and reserving only promise goods; the delivery is what moves
+   * them and the invoice is what earns the money. Each is its own call so
+   * the three stay as separate in the app as they are in the ledger.
+   */
+  async approveOrder(dealId) {
+    const { data, error } = await sb.rpc('approve_sales_order', { p_deal: dealId });
+    if (error) throw error;
+    return data;
+  },
+
+  async reserveOrder(dealId) {
+    const { data, error } = await sb.rpc('reserve_sales_order', { p_deal: dealId });
+    if (error) throw error;
+    return Number(data || 0);
+  },
+
+  async releaseOrder(dealId) {
+    const { data, error } = await sb.rpc('release_sales_order', { p_deal: dealId });
+    if (error) throw error;
+    return Number(data || 0);
+  },
+
+  async deliveries(dealId) {
+    const { data, error } = await sb.from('deliveries')
+      .select('*, lines:delivery_lines(*)')
+      .eq('deal_id', dealId)
+      .order('delivered_on', { ascending: false })
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    return data || [];
+  },
+
+  /* Header first, then the lines written fresh, the same shape as a goods
+   * receipt: the dialog always shows the whole delivery, so replacing beats
+   * patching. */
+  async saveDelivery(head, lines) {
+    const { company, warehouse } = await api.erpDefaults();
+    let id = head.id;
+    if (id) {
+      const { error } = await sb.from('deliveries').update({
+        delivered_on: head.delivered_on,
+        note: head.note || '',
+        picking_status: head.picking_status || 'picking',
+      }).eq('id', id);
+      if (error) throw error;
+      const del = await sb.from('delivery_lines').delete().eq('delivery_id', id);
+      if (del.error) throw del.error;
+    } else {
+      const { data: { user } } = await sb.auth.getUser();
+      const { data, error } = await sb.from('deliveries').insert({
+        company_id: company.id,
+        warehouse_id: warehouse.id,
+        deal_id: head.deal_id,
+        delivered_on: head.delivered_on,
+        note: head.note || '',
+        picking_status: head.picking_status || 'picking',
+        created_by: user?.id || null,
+      }).select('id').single();
+      if (error) throw error;
+      id = data.id;
+    }
+    const rows = lines.map((l) => ({
+      delivery_id: id,
+      deal_item_id: l.deal_item_id,
+      item_id: l.item_id,
+      qty_ordered: l.qty_ordered,
+      qty_picked: l.qty_picked,
+      qty_delivered: l.qty_delivered,
+      note: l.note || '',
+    }));
+    if (rows.length) {
+      const { error } = await sb.from('delivery_lines').insert(rows);
+      if (error) throw error;
+    }
+    return id;
+  },
+
+  async deleteDelivery(id) {
+    const { error } = await sb.from('deliveries').delete().eq('id', id);
+    if (error) throw error;
+  },
+
+  async postDelivery(id) {
+    const { error } = await sb.rpc('post_delivery', { p_delivery: id });
+    if (error) throw error;
+  },
+
+  async cancelDelivery(id, reason) {
+    const { error } = await sb.rpc('cancel_delivery', {
+      p_delivery: id, p_reason: reason || '',
+    });
+    if (error) throw error;
+  },
+
+  async salesInvoices(dealId) {
+    const { data, error } = await sb.from('sales_invoices')
+      .select('*, lines:sales_invoice_lines(*)')
+      .eq('deal_id', dealId)
+      .order('invoice_date', { ascending: false })
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    return data || [];
+  },
+
+  async saveSalesInvoice(head, lines) {
+    const { company } = await api.erpDefaults();
+    let id = head.id;
+    if (id) {
+      const { error } = await sb.from('sales_invoices').update({
+        invoice_date: head.invoice_date,
+        note: head.note || '',
+      }).eq('id', id);
+      if (error) throw error;
+      const del = await sb.from('sales_invoice_lines').delete().eq('invoice_id', id);
+      if (del.error) throw del.error;
+    } else {
+      const { data: { user } } = await sb.auth.getUser();
+      const { data, error } = await sb.from('sales_invoices').insert({
+        company_id: company.id,
+        deal_id: head.deal_id,
+        delivery_id: head.delivery_id || null,
+        party_id: head.party_id || null,
+        invoice_date: head.invoice_date,
+        currency: head.currency,
+        note: head.note || '',
+        created_by: user?.id || null,
+      }).select('id').single();
+      if (error) throw error;
+      id = data.id;
+    }
+    const rows = lines.map((l) => ({
+      invoice_id: id,
+      deal_item_id: l.deal_item_id,
+      item_id: l.item_id,
+      description: l.description || '',
+      qty: l.qty,
+      unit_price: l.unit_price,
+      discount: l.discount || 0,
+    }));
+    if (rows.length) {
+      const { error } = await sb.from('sales_invoice_lines').insert(rows);
+      if (error) throw error;
+    }
+    return id;
+  },
+
+  async deleteSalesInvoice(id) {
+    const { error } = await sb.from('sales_invoices').delete().eq('id', id);
+    if (error) throw error;
+  },
+
+  async postSalesInvoice(id) {
+    const { error } = await sb.rpc('post_sales_invoice', { p_invoice: id });
+    if (error) throw error;
+  },
+
+  async cancelSalesInvoice(id, reason) {
+    const { error } = await sb.rpc('cancel_sales_invoice', {
+      p_invoice: id, p_reason: reason || '',
+    });
+    if (error) throw error;
+  },
+
+  async creditNotes(dealId) {
+    const { data, error } = await sb.from('credit_notes')
+      .select('*, lines:credit_note_lines(*)')
+      .eq('deal_id', dealId)
+      .order('note_date', { ascending: false });
+    if (error) throw error;
+    return data || [];
+  },
+
+  async saveCreditNote(head, lines) {
+    const { company, warehouse } = await api.erpDefaults();
+    const { data: { user } } = await sb.auth.getUser();
+    const { data, error } = await sb.from('credit_notes').insert({
+      company_id: company.id,
+      warehouse_id: warehouse.id,
+      deal_id: head.deal_id,
+      invoice_id: head.invoice_id || null,
+      party_id: head.party_id || null,
+      note_date: head.note_date,
+      currency: head.currency,
+      reason: head.reason || '',
+      created_by: user?.id || null,
+    }).select('id').single();
+    if (error) throw error;
+
+    const rows = lines.map((l) => ({
+      credit_note_id: data.id,
+      deal_item_id: l.deal_item_id,
+      item_id: l.item_id,
+      qty: l.qty,
+      unit_price: l.unit_price,
+      unit_cost: l.unit_cost || 0,
+      restock: l.restock,
+    }));
+    if (rows.length) {
+      const { error: le } = await sb.from('credit_note_lines').insert(rows);
+      if (le) throw le;
+    }
+    return data.id;
+  },
+
+  async deleteCreditNote(id) {
+    const { error } = await sb.from('credit_notes').delete().eq('id', id);
+    if (error) throw error;
+  },
+
+  async postCreditNote(id) {
+    const { error } = await sb.rpc('post_credit_note', { p_note: id });
+    if (error) throw error;
+  },
+
+  /* What this order has promised, sent and billed, line by line. */
+  async salesProgress(dealId) {
+    const { data, error } = await sb.from('sales_progress').select('*').eq('deal_id', dealId);
+    if (error) throw error;
+    return data || [];
+  },
+
   /* Is this invoice number already on file? The same number arriving twice is
    * usually the same bill entered twice, which would double what you owe.
    */
@@ -1998,6 +2220,54 @@ async function viewDeal(id) {
       </div>
     </div>` : ''}
 
+    ${d.direction === 'receiving' ? `
+    <div class="card">
+      <div class="card-head">
+        <h3>Order and stock promised</h3>
+        <div class="spacer"></div>
+        ${canEdit() ? `
+          <button class="btn btn-sm" data-act="approve-order" type="button">Approve order</button>
+          <button class="btn btn-sm" data-act="reserve-order" type="button">Reserve stock</button>
+          <button class="btn btn-ghost btn-sm" data-act="release-order" type="button">Release</button>` : ''}
+      </div>
+      <div class="card-body tight" id="dl-fulfil">
+        <div class="empty">Loading…</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Deliveries</h3>
+        <div class="spacer"></div>
+        ${canEdit() ? '<button class="btn btn-sm" data-act="new-delivery" type="button">Deliver goods</button>' : ''}
+      </div>
+      <div class="card-body tight" id="dl-deliveries">
+        <div class="empty">Loading…</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Sales invoices</h3>
+        <div class="spacer"></div>
+        ${canEdit() ? '<button class="btn btn-sm" data-act="new-sales-invoice" type="button">Raise invoice</button>' : ''}
+      </div>
+      <div class="card-body tight" id="dl-sales-invoices">
+        <div class="empty">Loading…</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Returns and credit notes</h3>
+        <div class="spacer"></div>
+        ${canEdit() ? '<button class="btn btn-sm" data-act="new-credit-note" type="button">Credit note</button>' : ''}
+      </div>
+      <div class="card-body tight" id="dl-credit-notes">
+        <div class="empty">Loading…</div>
+      </div>
+    </div>` : ''}
+
     <div class="card">
       <div class="card-head">
         <h3>History</h3>
@@ -2014,6 +2284,7 @@ async function viewDeal(id) {
 
   paintHistory(d);
   if (d.direction === 'sending') paintReceipts(d, items);
+  if (d.direction === 'receiving') paintSales(d, items);
   wireDealActions(d, invoices);
 }
 
@@ -2277,6 +2548,727 @@ async function receiptDialog(d, items, existing) {
   };
 }
 
+/* --------------------------- the sales path (UI) ------------------------
+ * Three screens that must not be collapsed into one, because the ledger
+ * does not collapse them either: reserving promises goods, delivering
+ * moves them, invoicing earns the money.
+ */
+
+const DOC_STATUS = {
+  draft: ['Draft', ''],
+  posted: ['Posted', 'grn-posted'],
+  cancelled: ['Cancelled', 'grn-cancelled'],
+};
+
+function docChip(status) {
+  const [label, cls] = DOC_STATUS[status] || [status, ''];
+  return `<span class="grn-chip ${cls}">${esc(label)}</span>`;
+}
+
+/* Draft: edit, post or throw away. Posted: "delete" cancels it, so the
+ * record stays and its effect is reversed. Same rule as a goods receipt. */
+function docActions(kind, r) {
+  if (r.status === 'draft') {
+    return `<button class="btn btn-ghost btn-sm" data-${kind}="edit" data-id="${r.id}" type="button">Edit</button>
+            <button class="btn btn-sm" data-${kind}="post" data-id="${r.id}" type="button">Post</button>
+            <button class="btn btn-ghost btn-sm" data-${kind}="delete" data-id="${r.id}" type="button">✕</button>`;
+  }
+  if (r.status === 'posted' && kind !== 'cn') {
+    return `<button class="btn btn-ghost btn-sm" data-${kind}="cancel" data-id="${r.id}" type="button">Delete</button>`;
+  }
+  return '';
+}
+
+async function paintSales(d, items) {
+  await Promise.all([
+    paintFulfilment(d),
+    paintDeliveries(d, items),
+    paintSalesInvoices(d, items),
+    paintCreditNotes(d, items),
+  ]);
+}
+
+/* Ordered / reserved / delivered / invoiced, straight from sales_progress.
+ * Reserved is deliberately shown apart from delivered: the goods are still
+ * on the shelf, they are just spoken for. */
+async function paintFulfilment(d) {
+  const box = $('#dl-fulfil');
+  if (!box) return;
+  let rows = [];
+  try {
+    rows = await api.salesProgress(d.id);
+  } catch (e) {
+    box.innerHTML = `<div class="empty">${esc(errText(e))}</div>`;
+    return;
+  }
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">No items on this order yet.</div>';
+    return;
+  }
+
+  const state = rows[0].order_status;
+  box.innerHTML = `
+    <div class="table-scroll"><table class="data">
+      <thead><tr>
+        <th>Item</th><th class="r">Ordered</th><th class="r">Reserved</th>
+        <th class="r">Delivered</th><th class="r">Invoiced</th><th>Where it is</th>
+      </tr></thead>
+      <tbody>
+        ${rows.map((r) => `<tr>
+          <td>${esc(r.item_label || '—')}${
+            r.brand ? `<div class="dim" style="font-size:12px">${esc(r.brand)}</div>` : ''}</td>
+          <td class="r">${fmt(r.qty_ordered, null, 0)}</td>
+          <td class="r">${Number(r.qty_reserved) ? fmt(r.qty_reserved, null, 0) : '<span class="dim">—</span>'}</td>
+          <td class="r">${fmt(r.qty_delivered, null, 0)}</td>
+          <td class="r">${fmt(r.qty_invoiced, null, 0)}</td>
+          <td>${esc(r.fulfilment_state)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table></div>
+    <p class="preview-note" style="padding:10px 12px;margin:0">Order is <strong>${esc(state)}</strong>. Reserved goods are still on the shelf — they are promised to this customer, not sent. Only a delivery takes them out of stock.</p>`;
+}
+
+async function paintDeliveries(d, items) {
+  const box = $('#dl-deliveries');
+  if (!box) return;
+  let rows = [];
+  try {
+    rows = await api.deliveries(d.id);
+  } catch (e) {
+    box.innerHTML = `<div class="empty">${esc(errText(e))}</div>`;
+    return;
+  }
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty">Nothing sent out yet.${
+      canEdit() ? ' Use <strong>Deliver goods</strong> once they are picked.' : ''}</div>`;
+    return;
+  }
+
+  box.innerHTML = `
+    <div class="table-scroll"><table class="data">
+      <thead><tr>
+        <th>Note</th><th>Sent</th><th class="r">Items</th><th class="r">Units</th>
+        <th class="r">Stock cost</th><th>Status</th>${canEdit() ? '<th></th>' : ''}
+      </tr></thead>
+      <tbody>
+        ${rows.map((r) => {
+          const ls = r.lines || [];
+          const units = ls.reduce((s, l) => s + Number(l.qty_delivered || 0), 0);
+          const cost = ls.reduce((s, l) => s + Number(l.qty_delivered || 0) * Number(l.unit_cost || 0), 0);
+          return `<tr>
+            <td>${esc(r.doc_no || '—')}${
+              r.status === 'cancelled' && r.cancel_reason
+                ? `<div class="dim" style="font-size:12px">${esc(r.cancel_reason)}</div>` : ''}</td>
+            <td>${esc(dateLabel(r.delivered_on))}</td>
+            <td class="r">${ls.length}</td>
+            <td class="r">${fmt(units, null, 0)}</td>
+            <td class="r">${r.status === 'posted' ? fmt(cost, null, 3) : '<span class="dim">—</span>'}</td>
+            <td>${docChip(r.status)}${
+              r.status === 'draft' && r.picking_status !== 'checked'
+                ? '<div class="dim" style="font-size:12px">picking not checked</div>' : ''}</td>
+            ${canEdit() ? `<td class="act">${docActions('dn', r)}</td>` : ''}
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>
+    <p class="preview-note" style="padding:10px 12px;margin:0">Posting a delivery takes the goods out of stock at their weighted average cost and releases that cost to cost of sales. The stock cost column fills in once posted.</p>`;
+
+  box.onclick = async (e) => {
+    const btn = e.target.closest('button[data-dn]');
+    if (!btn) return;
+    const r = rows.find((x) => x.id === btn.dataset.id);
+    const act = btn.dataset.dn;
+    btn.disabled = true;
+    try {
+      if (act === 'edit') { await deliveryDialog(d, items, r); return; }
+      if (act === 'post') {
+        if (!await confirmAction(
+          'Post this delivery? It takes the goods out of stock and releases their cost to cost of sales.',
+          'Post')) return;
+        await api.postDelivery(r.id);
+        toast('Delivery posted — stock reduced', 'ok');
+        return viewDeal(d.id);
+      }
+      if (act === 'delete') {
+        if (!await confirmAction('Delete this draft delivery? Nothing has moved yet.', 'Delete')) return;
+        await api.deleteDelivery(r.id);
+        toast('Draft deleted', 'ok');
+        return viewDeal(d.id);
+      }
+      if (act === 'cancel') {
+        const reason = await askReason(
+          'Cancelling puts the goods back into stock at the cost they left on and reverses the journal. The note stays on file showing who cancelled it and why.');
+        if (reason === null) return;
+        await api.cancelDelivery(r.id, reason);
+        toast('Delivery cancelled and reversed', 'ok');
+        return viewDeal(d.id);
+      }
+    } catch (err) {
+      toast(errText(err), 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+async function paintSalesInvoices(d, items) {
+  const box = $('#dl-sales-invoices');
+  if (!box) return;
+  let rows = [];
+  try {
+    rows = await api.salesInvoices(d.id);
+  } catch (e) {
+    box.innerHTML = `<div class="empty">${esc(errText(e))}</div>`;
+    return;
+  }
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty">Nothing billed yet.${
+      canEdit() ? ' Raise the invoice once the goods have gone out.' : ''}</div>`;
+    return;
+  }
+
+  box.innerHTML = `
+    <div class="table-scroll"><table class="data">
+      <thead><tr>
+        <th>Invoice</th><th>Date</th><th>Due</th><th class="r">Amount</th>
+        <th>Status</th>${canEdit() ? '<th></th>' : ''}
+      </tr></thead>
+      <tbody>
+        ${rows.map((r) => {
+          const total = (r.lines || []).reduce(
+            (s, l) => s + Number(l.qty || 0) * Number(l.unit_price || 0) - Number(l.discount || 0), 0)
+            + Number(r.tax_amount || 0);
+          return `<tr>
+            <td>${esc(r.doc_no || '—')}${
+              r.status === 'cancelled' && r.cancel_reason
+                ? `<div class="dim" style="font-size:12px">${esc(r.cancel_reason)}</div>` : ''}</td>
+            <td>${esc(dateLabel(r.invoice_date))}</td>
+            <td>${r.due_date ? esc(dateLabel(r.due_date)) : '<span class="dim">—</span>'}</td>
+            <td class="r">${fmt(total, r.currency, decOf(r.currency))}</td>
+            <td>${docChip(r.status)}</td>
+            ${canEdit() ? `<td class="act">${docActions('si', r)}</td>` : ''}
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>
+    <p class="preview-note" style="padding:10px 12px;margin:0">Posting the invoice earns the revenue and starts the clock on what the customer owes. It moves no goods — the delivery already did that.</p>`;
+
+  box.onclick = async (e) => {
+    const btn = e.target.closest('button[data-si]');
+    if (!btn) return;
+    const r = rows.find((x) => x.id === btn.dataset.id);
+    const act = btn.dataset.si;
+    btn.disabled = true;
+    try {
+      if (act === 'edit') { await salesInvoiceDialog(d, items, r); return; }
+      if (act === 'post') {
+        if (!await confirmAction(
+          'Post this invoice? It records the sale and what the customer owes.', 'Post')) return;
+        await api.postSalesInvoice(r.id);
+        toast('Invoice posted', 'ok');
+        return viewDeal(d.id);
+      }
+      if (act === 'delete') {
+        if (!await confirmAction('Delete this draft invoice? Nothing has been booked yet.', 'Delete')) return;
+        await api.deleteSalesInvoice(r.id);
+        toast('Draft deleted', 'ok');
+        return viewDeal(d.id);
+      }
+      if (act === 'cancel') {
+        const reason = await askReason(
+          'Cancelling reverses the sale and the customer debt. The invoice stays on file showing who cancelled it and why. To give goods back as well, use a credit note instead.');
+        if (reason === null) return;
+        await api.cancelSalesInvoice(r.id, reason);
+        toast('Invoice cancelled and reversed', 'ok');
+        return viewDeal(d.id);
+      }
+    } catch (err) {
+      toast(errText(err), 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+async function paintCreditNotes(d, items) {
+  const box = $('#dl-credit-notes');
+  if (!box) return;
+  let rows = [];
+  try {
+    rows = await api.creditNotes(d.id);
+  } catch (e) {
+    box.innerHTML = `<div class="empty">${esc(errText(e))}</div>`;
+    return;
+  }
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">Nothing has come back.</div>';
+    return;
+  }
+
+  box.innerHTML = `
+    <div class="table-scroll"><table class="data">
+      <thead><tr>
+        <th>Note</th><th>Date</th><th class="r">Units back</th><th class="r">Credit</th>
+        <th>Stock</th><th>Status</th>${canEdit() ? '<th></th>' : ''}
+      </tr></thead>
+      <tbody>
+        ${rows.map((r) => {
+          const ls = r.lines || [];
+          const units = ls.reduce((s, l) => s + Number(l.qty || 0), 0);
+          const credit = ls.reduce((s, l) => s + Number(l.qty || 0) * Number(l.unit_price || 0), 0);
+          const back = ls.filter((l) => l.restock).reduce((s, l) => s + Number(l.qty || 0), 0);
+          return `<tr>
+            <td>${esc(r.doc_no || '—')}${
+              r.reason ? `<div class="dim" style="font-size:12px">${esc(r.reason)}</div>` : ''}</td>
+            <td>${esc(dateLabel(r.note_date))}</td>
+            <td class="r">${fmt(units, null, 0)}</td>
+            <td class="r">${fmt(credit, r.currency, decOf(r.currency))}</td>
+            <td>${back ? `${fmt(back, null, 0)} back on the shelf` : '<span class="dim">written off</span>'}</td>
+            <td>${docChip(r.status)}</td>
+            ${canEdit() ? `<td class="act">${docActions('cn', r)}</td>` : ''}
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>
+    <p class="preview-note" style="padding:10px 12px;margin:0">A credit note always reduces the sale and what the customer owes. Only the units you accept back go onto the shelf again — damaged ones are credited but written off.</p>`;
+
+  box.onclick = async (e) => {
+    const btn = e.target.closest('button[data-cn]');
+    if (!btn) return;
+    const r = rows.find((x) => x.id === btn.dataset.id);
+    const act = btn.dataset.cn;
+    btn.disabled = true;
+    try {
+      if (act === 'post') {
+        if (!await confirmAction(
+          'Post this credit note? It reduces the sale and puts the accepted goods back into stock.',
+          'Post')) return;
+        await api.postCreditNote(r.id);
+        toast('Credit note posted', 'ok');
+        return viewDeal(d.id);
+      }
+      if (act === 'delete') {
+        if (!await confirmAction('Delete this draft credit note? Nothing has been booked yet.', 'Delete')) return;
+        await api.deleteCreditNote(r.id);
+        toast('Draft deleted', 'ok');
+        return viewDeal(d.id);
+      }
+      if (act === 'edit') {
+        toast('Delete this draft and raise it again to change it', 'err');
+      }
+    } catch (err) {
+      toast(errText(err), 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+/* Pick, check, send. Pre-filled with what is still undelivered, because the
+ * common case is "the rest of it is going out now". */
+async function deliveryDialog(d, items, existing) {
+  const byItem = new Map((existing?.lines || []).map((l) => [l.deal_item_id, l]));
+  const today = new Date().toISOString().slice(0, 10);
+
+  const rows = items.map((it) => {
+    const prev = byItem.get(it.id);
+    const ordered = Number(it.qty || 0);
+    const already = Number(it.qty_delivered || 0);
+    const outstanding = Math.max(ordered - already, 0);
+    return {
+      deal_item_id: it.id,
+      item_id: it.item_id || null,
+      label: (it.model || '').trim() || it.description || '—',
+      brand: it.brand || '',
+      ordered,
+      outstanding,
+      picked: prev ? Number(prev.qty_picked) : outstanding,
+      delivered: prev ? Number(prev.qty_delivered) : outstanding,
+    };
+  });
+
+  const m = openModal({
+    title: existing ? 'Edit delivery' : 'Deliver goods',
+    width: '820px',
+    body: `
+      <div class="grid-form">
+        <label class="field"><span>Sent on</span>
+          <input id="dn-date" type="date" value="${esc(existing?.delivered_on || today)}">
+        </label>
+        <label class="field"><span>Picking</span>
+          <select id="dn-pick">
+            <option value="picking">Still picking</option>
+            <option value="checked">Checked — ready to send</option>
+          </select>
+        </label>
+        <label class="field wide"><span>Note <em>(optional)</em></span>
+          <input id="dn-note" type="text" maxlength="200" value="${esc(existing?.note || '')}"
+                 placeholder="who picked it, vehicle, delivery contact">
+        </label>
+      </div>
+      <div class="table-scroll" style="margin-top:14px"><table class="data">
+        <thead><tr>
+          <th>Item</th><th class="r">Ordered</th><th class="r">Still to send</th>
+          <th class="r">Picked</th><th class="r">Delivered</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map((r, i) => `<tr data-i="${i}">
+            <td>${esc(r.label)}${r.brand ? `<div class="dim" style="font-size:12px">${esc(r.brand)}</div>` : ''}</td>
+            <td class="r">${fmt(r.ordered, null, 0)}</td>
+            <td class="r">${fmt(r.outstanding, null, 0)}</td>
+            <td class="r"><input class="qty-in" data-f="picked" type="number" min="0" step="any" value="${r.picked}"></td>
+            <td class="r"><input class="qty-in" data-f="delivered" type="number" min="0" step="any" value="${r.delivered}"></td>
+          </tr>`).join('')}
+        </tbody>
+      </table></div>
+      <div id="dn-problem"></div>
+      <p class="preview-note" style="margin:10px 0 0">A delivery has to be <strong>checked</strong> before it can be posted. The cost of the goods is worked out at posting from the running average, so there is nothing to type here.</p>`,
+    foot: `<button class="btn" data-close type="button">Cancel</button>
+           <button class="btn btn-primary" data-save type="button">Save draft</button>`,
+  });
+
+  m.querySelector('#dn-pick').value = existing?.picking_status || 'picking';
+
+  const read = () => rows.map((r, i) => {
+    const tr = m.querySelector(`tr[data-i="${i}"]`);
+    const num = (f) => Math.max(Number(tr.querySelector(`[data-f="${f}"]`).value) || 0, 0);
+    return {
+      deal_item_id: r.deal_item_id,
+      item_id: r.item_id,
+      qty_ordered: r.outstanding,
+      qty_picked: num('picked'),
+      qty_delivered: num('delivered'),
+      label: r.label,
+      outstanding: r.outstanding,
+    };
+  });
+
+  /* Say it in words here rather than letting the database refuse it after
+   * the form has been lost. */
+  const check = (ls) => {
+    const bad = [];
+    for (const l of ls) {
+      if (l.qty_delivered > l.qty_picked) {
+        bad.push(`${l.label}: more delivered than picked.`);
+      }
+      if (l.qty_delivered > l.outstanding && l.outstanding > 0) {
+        bad.push(`${l.label}: ${fmt(l.qty_delivered, null, 0)} going out but only ${fmt(l.outstanding, null, 0)} still due.`);
+      }
+      if (l.qty_delivered > 0 && !l.item_id) {
+        bad.push(`${l.label}: not linked to an item, so stock cannot be moved.`);
+      }
+    }
+    return bad;
+  };
+
+  const problem = m.querySelector('#dn-problem');
+  const paint = () => {
+    const bad = check(read());
+    problem.innerHTML = bad.length
+      ? `<div class="notice-err"><strong>Check this before saving</strong><ul style="margin:6px 0 0 18px">${
+          bad.map((b) => `<li>${esc(b)}</li>`).join('')}</ul></div>`
+      : '';
+    return bad;
+  };
+  m.querySelectorAll('.qty-in').forEach((el) => { el.oninput = paint; });
+  paint();
+
+  m.querySelector('[data-save]').onclick = async (e) => {
+    if (paint().length) { toast('Fix the highlighted lines first', 'err'); return; }
+    const ls = read().filter((l) => l.qty_picked > 0 || l.qty_delivered > 0);
+    if (!ls.length) { toast('Nothing to send — enter what is going out', 'err'); return; }
+    e.target.disabled = true;
+    try {
+      await api.saveDelivery({
+        id: existing?.id,
+        deal_id: d.id,
+        delivered_on: m.querySelector('#dn-date').value || today,
+        note: m.querySelector('#dn-note').value.trim(),
+        picking_status: m.querySelector('#dn-pick').value,
+      }, ls);
+      closeModal();
+      toast('Draft delivery saved — post it when the goods leave', 'ok');
+      await viewDeal(d.id);
+    } catch (err) {
+      toast(errText(err), 'err');
+      e.target.disabled = false;
+    }
+  };
+}
+
+/* Bill what has gone out. Pre-filled with delivered-but-not-yet-invoiced,
+ * because invoicing goods that never left is how stock and revenue part
+ * company. */
+async function salesInvoiceDialog(d, items, existing) {
+  const dec = d.cur_decimals;
+  const today = new Date().toISOString().slice(0, 10);
+  const byItem = new Map((existing?.lines || []).map((l) => [l.deal_item_id, l]));
+
+  let progress = [];
+  try {
+    progress = await api.salesProgress(d.id);
+  } catch { /* fall back to the order lines below */ }
+  const prog = new Map(progress.map((p) => [p.deal_item_id, p]));
+
+  const rows = items.map((it) => {
+    const prev = byItem.get(it.id);
+    const p = prog.get(it.id);
+    const toBill = p ? Number(p.qty_to_invoice || 0) : 0;
+    return {
+      deal_item_id: it.id,
+      item_id: it.item_id || null,
+      label: (it.model || '').trim() || it.description || '—',
+      description: it.description || '',
+      delivered: p ? Number(p.qty_delivered || 0) : 0,
+      toBill,
+      qty: prev ? Number(prev.qty) : toBill,
+      price: prev ? Number(prev.unit_price) : Number(it.unit_price || 0),
+      discount: prev ? Number(prev.discount) : 0,
+    };
+  });
+
+  const m = openModal({
+    title: existing ? 'Edit sales invoice' : 'Raise sales invoice',
+    width: '860px',
+    body: `
+      <div class="grid-form">
+        <label class="field"><span>Invoice date</span>
+          <input id="si-date" type="date" value="${esc(existing?.invoice_date || today)}">
+        </label>
+        <label class="field"><span>Currency</span>
+          <input type="text" value="${esc(d.currency)}" disabled>
+        </label>
+        <label class="field wide"><span>Note <em>(optional)</em></span>
+          <input id="si-note" type="text" maxlength="200" value="${esc(existing?.note || '')}"
+                 placeholder="purchase order reference, delivery contact">
+        </label>
+      </div>
+      <div class="table-scroll" style="margin-top:14px"><table class="data">
+        <thead><tr>
+          <th>Item</th><th class="r">Delivered</th><th class="r">To bill</th>
+          <th class="r">Qty</th><th class="r">Unit price</th><th class="r">Discount</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map((r, i) => `<tr data-i="${i}">
+            <td>${esc(r.label)}</td>
+            <td class="r">${fmt(r.delivered, null, 0)}</td>
+            <td class="r">${fmt(r.toBill, null, 0)}</td>
+            <td class="r"><input class="qty-in" data-f="qty" type="number" min="0" step="any" value="${r.qty}"></td>
+            <td class="r"><input class="qty-in" data-f="price" type="number" min="0" step="any" value="${r.price}"></td>
+            <td class="r"><input class="qty-in" data-f="discount" type="number" min="0" step="any" value="${r.discount}"></td>
+          </tr>`).join('')}
+        </tbody>
+        <tfoot><tr><td colspan="5" class="r">Invoice total</td><td class="r" id="si-total">—</td></tr></tfoot>
+      </table></div>
+      <div id="si-problem"></div>
+      <p class="preview-note" style="margin:10px 0 0">Tax is not configured for this company, so nothing is added. Due date comes from the customer's payment terms when you post.</p>`,
+    foot: `<button class="btn" data-close type="button">Cancel</button>
+           <button class="btn btn-primary" data-save type="button">Save draft</button>`,
+  });
+
+  const read = () => rows.map((r, i) => {
+    const tr = m.querySelector(`tr[data-i="${i}"]`);
+    const num = (f) => Math.max(Number(tr.querySelector(`[data-f="${f}"]`).value) || 0, 0);
+    return {
+      deal_item_id: r.deal_item_id,
+      item_id: r.item_id,
+      description: r.description,
+      qty: num('qty'),
+      unit_price: num('price'),
+      discount: num('discount'),
+      label: r.label,
+      toBill: r.toBill,
+    };
+  });
+
+  const problem = m.querySelector('#si-problem');
+  const paint = () => {
+    const ls = read();
+    const total = ls.reduce((s, l) => s + l.qty * l.unit_price - l.discount, 0);
+    m.querySelector('#si-total').textContent = fmt(total, d.currency, dec);
+
+    const bad = [];
+    for (const l of ls) {
+      if (l.qty > 0 && l.qty > l.toBill) {
+        bad.push(`${l.label}: billing ${fmt(l.qty, null, 0)} but only ${fmt(l.toBill, null, 0)} has been delivered and not yet billed.`);
+      }
+      if (l.qty * l.unit_price - l.discount < 0) {
+        bad.push(`${l.label}: the discount is more than the line.`);
+      }
+    }
+    problem.innerHTML = bad.length
+      ? `<div class="notice-err"><strong>Check this before saving</strong><ul style="margin:6px 0 0 18px">${
+          bad.map((b) => `<li>${esc(b)}</li>`).join('')}</ul></div>`
+      : '';
+    return bad;
+  };
+  m.querySelectorAll('.qty-in').forEach((el) => { el.oninput = paint; });
+  paint();
+
+  m.querySelector('[data-save]').onclick = async (e) => {
+    if (paint().length) { toast('Fix the highlighted lines first', 'err'); return; }
+    const ls = read().filter((l) => l.qty > 0);
+    if (!ls.length) { toast('Nothing to bill — enter a quantity', 'err'); return; }
+    e.target.disabled = true;
+    try {
+      const dns = await api.deliveries(d.id);
+      const posted = dns.find((x) => x.status === 'posted');
+      await api.saveSalesInvoice({
+        id: existing?.id,
+        deal_id: d.id,
+        delivery_id: existing?.delivery_id || posted?.id || null,
+        party_id: d.party_id || null,
+        invoice_date: m.querySelector('#si-date').value || today,
+        currency: d.currency,
+        note: m.querySelector('#si-note').value.trim(),
+      }, ls);
+      closeModal();
+      toast('Draft invoice saved — post it to record the sale', 'ok');
+      await viewDeal(d.id);
+    } catch (err) {
+      toast(errText(err), 'err');
+      e.target.disabled = false;
+    }
+  };
+}
+
+/* What came back. Accepted goods go on the shelf again at the cost they
+ * left on; rejected ones are credited but written off. */
+async function creditNoteDialog(d, items) {
+  const dec = d.cur_decimals;
+  const today = new Date().toISOString().slice(0, 10);
+
+  const [invoices, dns] = await Promise.all([api.salesInvoices(d.id), api.deliveries(d.id)]);
+  const postedInvoices = invoices.filter((x) => x.status === 'posted');
+  if (!postedInvoices.length) {
+    toast('Post a sales invoice first — a credit note reverses one', 'err');
+    return;
+  }
+
+  // The cost the goods left on, so they come back at the same number.
+  const costs = new Map();
+  for (const dn of dns) {
+    if (dn.status !== 'posted') continue;
+    for (const l of dn.lines || []) {
+      if (Number(l.unit_cost) > 0) costs.set(l.deal_item_id, Number(l.unit_cost));
+    }
+  }
+
+  const rows = items.map((it) => ({
+    deal_item_id: it.id,
+    item_id: it.item_id || null,
+    label: (it.model || '').trim() || it.description || '—',
+    price: Number(it.unit_price || 0),
+    cost: costs.get(it.id) || 0,
+  }));
+
+  const m = openModal({
+    title: 'Credit note',
+    width: '820px',
+    body: `
+      <div class="grid-form">
+        <label class="field"><span>Against invoice</span>
+          <select id="cn-inv">
+            ${postedInvoices.map((x) => `<option value="${x.id}">${esc(x.doc_no || 'invoice')} — ${
+              esc(dateLabel(x.invoice_date))}</option>`).join('')}
+          </select>
+        </label>
+        <label class="field"><span>Date</span>
+          <input id="cn-date" type="date" value="${today}">
+        </label>
+        <label class="field wide"><span>Why it came back</span>
+          <input id="cn-reason" type="text" maxlength="200" placeholder="wrong part, damaged in transit, over-supplied">
+        </label>
+      </div>
+      <div class="table-scroll" style="margin-top:14px"><table class="data">
+        <thead><tr>
+          <th>Item</th><th class="r">Qty back</th><th class="r">Credit each</th>
+          <th class="r">Cost each</th><th>Back on the shelf?</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map((r, i) => `<tr data-i="${i}">
+            <td>${esc(r.label)}</td>
+            <td class="r"><input class="qty-in" data-f="qty" type="number" min="0" step="any" value="0"></td>
+            <td class="r"><input class="qty-in" data-f="price" type="number" min="0" step="any" value="${r.price}"></td>
+            <td class="r"><input class="qty-in" data-f="cost" type="number" min="0" step="any" value="${r.cost}"></td>
+            <td><label class="check"><input type="checkbox" data-f="restock" checked> Accepted</label></td>
+          </tr>`).join('')}
+        </tbody>
+        <tfoot><tr><td colspan="4" class="r">Credit total</td><td class="r" id="cn-total">—</td></tr></tfoot>
+      </table></div>
+      <div id="cn-problem"></div>
+      <p class="preview-note" style="margin:10px 0 0">Untick <strong>Accepted</strong> for goods that came back broken: the customer is still credited, but they do not go back into sellable stock.</p>`,
+    foot: `<button class="btn" data-close type="button">Cancel</button>
+           <button class="btn btn-primary" data-save type="button">Save draft</button>`,
+  });
+
+  const read = () => rows.map((r, i) => {
+    const tr = m.querySelector(`tr[data-i="${i}"]`);
+    const num = (f) => Math.max(Number(tr.querySelector(`[data-f="${f}"]`).value) || 0, 0);
+    return {
+      deal_item_id: r.deal_item_id,
+      item_id: r.item_id,
+      qty: num('qty'),
+      unit_price: num('price'),
+      unit_cost: num('cost'),
+      restock: tr.querySelector('[data-f="restock"]').checked,
+      label: r.label,
+    };
+  });
+
+  const problem = m.querySelector('#cn-problem');
+  const paint = () => {
+    const ls = read();
+    m.querySelector('#cn-total').textContent =
+      fmt(ls.reduce((s, l) => s + l.qty * l.unit_price, 0), d.currency, dec);
+
+    const bad = [];
+    for (const l of ls) {
+      if (l.qty > 0 && l.restock && l.unit_cost <= 0) {
+        bad.push(`${l.label}: accepted back with no cost, so it cannot be valued into stock.`);
+      }
+      if (l.qty > 0 && l.restock && !l.item_id) {
+        bad.push(`${l.label}: not linked to an item, so it cannot go back into stock.`);
+      }
+    }
+    problem.innerHTML = bad.length
+      ? `<div class="notice-err"><strong>Check this before saving</strong><ul style="margin:6px 0 0 18px">${
+          bad.map((b) => `<li>${esc(b)}</li>`).join('')}</ul></div>`
+      : '';
+    return bad;
+  };
+  m.querySelectorAll('.qty-in, [data-f="restock"]').forEach((el) => {
+    el.oninput = paint;
+    el.onchange = paint;
+  });
+  paint();
+
+  m.querySelector('[data-save]').onclick = async (e) => {
+    if (paint().length) { toast('Fix the highlighted lines first', 'err'); return; }
+    const ls = read().filter((l) => l.qty > 0);
+    if (!ls.length) { toast('Nothing came back — enter a quantity', 'err'); return; }
+    const reason = m.querySelector('#cn-reason').value.trim();
+    if (!reason) { toast('Say why the goods came back', 'err'); return; }
+    e.target.disabled = true;
+    try {
+      await api.saveCreditNote({
+        deal_id: d.id,
+        invoice_id: m.querySelector('#cn-inv').value,
+        party_id: d.party_id || null,
+        note_date: m.querySelector('#cn-date').value || today,
+        currency: d.currency,
+        reason,
+      }, ls);
+      closeModal();
+      toast('Draft credit note saved — post it to credit the customer', 'ok');
+      await viewDeal(d.id);
+    } catch (err) {
+      toast(errText(err), 'err');
+      e.target.disabled = false;
+    }
+  };
+}
+
 /* A delete that leaves a trace needs a reason, so the History card can say
  * why as well as who.
  */
@@ -2412,6 +3404,50 @@ function wireDealActions(d, invoices) {
         }
         return receiptDialog(d, items);
       }
+
+      /* ---- the sales path. Order of operations is the point here: the
+       * database refuses out-of-order steps, so say so in words first. ---- */
+      if (act === 'approve-order') {
+        const no = await api.approveOrder(d.id);
+        toast(`Order approved as ${no}`, 'ok');
+        return reload();
+      }
+      if (act === 'reserve-order') {
+        const n = await api.reserveOrder(d.id);
+        toast(n > 0
+          ? `${fmt(n, null, 0)} units reserved — still on the shelf, now spoken for`
+          : 'Nothing left to reserve on this order', n > 0 ? 'ok' : 'err');
+        return reload();
+      }
+      if (act === 'release-order') {
+        if (!await confirmAction(
+          'Release the stock promised to this order? The goods stay where they are and become free to sell to someone else.',
+          'Release')) return;
+        const n = await api.releaseOrder(d.id);
+        toast(n > 0 ? `${fmt(n, null, 0)} units released` : 'Nothing was reserved', 'ok');
+        return reload();
+      }
+      if (act === 'new-delivery') {
+        const { items } = await api.deal(d.id);
+        if (!items.length) {
+          toast('Add the order items first — there is nothing to send', 'err');
+          return;
+        }
+        return deliveryDialog(d, items);
+      }
+      if (act === 'new-sales-invoice') {
+        const { items } = await api.deal(d.id);
+        if (!items.length) {
+          toast('Add the order items first — there is nothing to bill', 'err');
+          return;
+        }
+        return salesInvoiceDialog(d, items);
+      }
+      if (act === 'new-credit-note') {
+        const { items } = await api.deal(d.id);
+        return creditNoteDialog(d, items);
+      }
+
       if (act === 'purge-deal') {
         if (!await confirmAction(
           `Permanently delete "${d.party}" with all its items, payments and invoices? This cannot be undone.`,
