@@ -596,9 +596,19 @@ table.data tfoot tr:last-child td { font-weight: 600; color: var(--ink); font-si
 .preview-scroll { max-height: 46vh; overflow: auto; }
 
 /* Keep the columns at a readable width and scroll sideways instead of crushing
-   Description until Qty, Price and Amount have nowhere left to go. */
-.preview-scroll > table.data { min-width: 860px; }
-.preview-scroll td.desc { min-width: 240px; }
+   Description until Qty, Price and Amount have nowhere left to go.
+
+   A floor on the table alone is not enough. On the full-width New purchase page
+   the container is about that wide, so the table *fits*, overflow-x has nothing
+   to do, and every column is squeezed to its narrowest instead — "Mindware
+   Computers" wrapping onto two lines while Amount sits under the vertical
+   scrollbar with no way to reach it. Only Description may wrap; every other
+   cell keeps its natural width, and that is what pushes the table past the
+   container and hands the overflow to .table-scroll. */
+.preview-scroll > table.data { min-width: 1040px; }
+.preview-scroll table.data th,
+.preview-scroll table.data td { white-space: nowrap; }
+.preview-scroll table.data td.desc { white-space: normal; min-width: 260px; max-width: 420px; }
 .preview-scroll thead th {
   position: sticky; top: 0; z-index: 1;
   background: var(--surface);
@@ -836,4 +846,4 @@ a.uid-chip:hover { text-decoration: underline; }
 /* Inside a scrolling preview the vertical scrollbar sits where the table's own
    right edge is, so the last column needs a little room to clear it. */
 .preview-scroll table.data th:last-child,
-.preview-scroll table.data td:last-child { padding-right: 6px; }
+.preview-scroll table.data td:last-child { padding-right: 14px; }

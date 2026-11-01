@@ -448,6 +448,19 @@ const api = {
    * or came from an earlier invoice, and a thinner line on a later invoice
    * should not wipe it. Returns which fields were actually filled in.
    */
+  /* The number a new supplier is about to get, without taking it. Calling
+   * the real generator for a preview would burn a code every time an import
+   * was opened and abandoned, and codes are never reused, so the hole would
+   * be permanent. */
+  async peekSupplierNo() {
+    const { company } = await api.erpDefaults();
+    const { data, error } = await sb.rpc('peek_party_code', {
+      p_company: company.id, p_kind: 'supplier',
+    });
+    if (error) throw error;
+    return data;
+  },
+
   /* Give this account its supplier number, or hand back the one it already
    * has. Safe to call twice: the database reuses what is on file rather than
    * issuing a second number. */
@@ -458,6 +471,19 @@ const api = {
     });
     if (error) throw error;
     return data;
+  },
+
+  /* Rename an account's number outright. This is the opposite of
+   * ensureSupplierNo, which deliberately keeps whatever is on file: here the
+   * caller has already asked and been told the change follows the account
+   * onto every invoice, old and new. The unique index still refuses a number
+   * another account holds. */
+  async setSupplierNo(partyId, number) {
+    const code = String(number || '').trim();
+    if (!partyId || !code) return null;
+    const { error } = await sb.from('parties').update({ supplier_no: code }).eq('id', partyId);
+    if (error) throw error;
+    return code;
   },
 
   async savePartyDetails(partyId, { supplier_no, details }) {
@@ -1814,6 +1840,12 @@ async function viewNewDeal(direction) {
             <span>${dir.word} name</span>
             <input name="party" required placeholder="${direction === 'receiving' ? 'e.g. Ministry of Public Works' : 'e.g. GUANGZHOU DSPPA AUDIO CO., LTD.'}">
           </label>
+          ${direction === 'sending' ? `
+          <label class="field">
+            <span>Supplier number</span>
+            <input name="party_no" placeholder="assigned when you save"
+              autocapitalize="characters" spellcheck="false">
+          </label>` : ''}
           <label class="field">
             <span>${direction === 'receiving' ? 'Quote no' : 'Purchase no'}</span>
             <input name="reference" placeholder="generated automatically">
@@ -1932,12 +1964,17 @@ async function viewNewDeal(direction) {
   const supplierNote = () => {
     if (supno.conflict && supno.source === 'taken') {
       return `<div class="notice-warn"><strong>Supplier number ${esc(supno.conflict)} belongs to ${
-        esc(supno.takenBy)}.</strong> It will not be reused — this supplier gets their own number when you save.</div>`;
+        esc(supno.takenBy)}.</strong> It will not be reused — this supplier gets ${
+        supno.number ? `<strong>${esc(supno.number)}</strong>` : 'their own number'} when you save.</div>`;
     }
     if (supno.conflict) {
       return `<div class="notice-warn"><strong>This sheet says ${esc(supno.conflict)}, but ${
         esc(supno.party?.name || 'this supplier')} is already ${esc(supno.number)}.</strong>
         Keeping ${esc(supno.number)} — one supplier only ever holds one number. Change it in <em>Edit details</em> on the account if the sheet is right.</div>`;
+    }
+    if (supno.source === 'manual') {
+      return `<p class="preview-note" style="margin:0">Supplier number <strong>${esc(supno.number)}</strong>, set by hand — it becomes ${
+        esc(supno.party?.name || 'this supplier')}'s number on every invoice, the ones already recorded included.</p>`;
     }
     if (supno.source === 'account') {
       return `<p class="preview-note" style="margin:0">Existing account <strong>${
@@ -1947,7 +1984,36 @@ async function viewNewDeal(direction) {
       return `<p class="preview-note" style="margin:0">Supplier number ${
         esc(supno.number)} taken from the sheet.</p>`;
     }
-    return `<p class="preview-note" style="margin:0">New supplier — a number is assigned when you save, so no two accounts can share one.</p>`;
+    return supno.number
+      ? `<p class="preview-note" style="margin:0">New supplier — <strong>${
+          esc(supno.number)}</strong>, which is theirs once you save. No two accounts can share a number.</p>`
+      : `<p class="preview-note" style="margin:0">New supplier — a number is assigned when you save, so no two accounts can share one.</p>`;
+  };
+
+  const supNoInput = () => $('#new-form [name=party_no]');
+
+  /* Settle which number this supplier holds and put it in the field, so the
+   * number is on screen before anything is saved. An account already on file
+   * keeps its number; a supplier we have not met yet gets a prediction, not a
+   * reservation — the database has the final say when the record is created.
+   */
+  const settleSupplierNo = async (name, claim) => {
+    if (direction !== 'sending') return;
+    try {
+      const { parties } = await api.parties();
+      supno = resolveSupplierNo(name, claim, parties);
+    } catch {
+      supno = { number: claim || null, party: null, source: claim ? 'invoice' : 'new', conflict: null };
+    }
+    if (!supno.number) {
+      try {
+        supno.number = await api.peekSupplierNo();
+        supno.predicted = true;
+      } catch { /* the note under the table still explains what happens */ }
+    }
+    supno.settled = supno.number || '';
+    const box = supNoInput();
+    if (box) box.value = supno.settled;
   };
 
   // A supplier invoice: read who it is from, and reuse their existing account so no duplicate is made.
@@ -1958,6 +2024,7 @@ async function viewNewDeal(direction) {
     }
     let hit = null;
     try { hit = matchParty(info.supplier, (await api.parties()).parties); } catch { /* fall back to the name as printed */ }
+    await settleSupplierNo(info.supplier, '');
     const nameInput = $('#new-form [name=party]');
     if (nameInput && !nameInput.value.trim()) nameInput.value = hit ? hit.party.name : info.supplier;
     const invInput = $('#new-form [name=invoice_no]');
@@ -1977,12 +2044,7 @@ async function viewNewDeal(direction) {
       sheet = got.info;
       // Settle the supplier number before showing the list, so the preview
       // says which account this is going to rather than leaving it to save.
-      try {
-        const { parties } = await api.parties();
-        supno = resolveSupplierNo(sheet.party_name, sheet.party_no, parties);
-      } catch {
-        supno = { number: sheet.party_no || null, party: null, source: sheet.party_no ? 'invoice' : 'new', conflict: null };
-      }
+      await settleSupplierNo(sheet.party_name, sheet.party_no);
       showPending();
       // The invoice columns tell us who the record is with and which invoice it
       // is, so those are filled in rather than retyped. They stay editable.
@@ -2000,6 +2062,47 @@ async function viewNewDeal(direction) {
       if (invInput && !invInput.value.trim() && sheet.invoice_no) invInput.value = sheet.invoice_no;
     }
   };
+
+  /* The number belongs to the account, not to this one invoice, so typing a
+   * different one here renumbers the supplier everywhere. That is worth being
+   * told before it happens, and worth refusing when the number is someone
+   * else's — a shared number splits a supplier's balance across two accounts.
+   */
+  supNoInput()?.addEventListener('change', async () => {
+    const box = supNoInput();
+    const was = supno.settled || '';
+    const wanted = box.value.trim().toUpperCase();
+    box.value = wanted || was;
+    if (!wanted || wanted === was) {
+      // An account must never end up unnumbered, so an empty box means "leave it".
+      if (!wanted && was) toast(`Kept ${was} — an account always holds a number.`, 'ok');
+      return;
+    }
+
+    let parties = [];
+    try { ({ parties } = await api.parties()); } catch { /* the unique index still refuses it on save */ }
+    const clash = parties.find((p) => p.id !== supno.party?.id
+      && String(p.supplier_no || '').trim().toLowerCase() === wanted.toLowerCase());
+    if (clash) {
+      box.value = was;
+      return toast(`${wanted} is already ${clash.name}'s number. One account holds one number, so pick another.`, 'err');
+    }
+
+    const who = supno.party?.name || String($('#new-form [name=party]').value || '').trim() || 'this supplier';
+    const ok = await confirmAction(supno.party
+      ? `${was} is ${who}'s account number, not a number on this one invoice. Changing it to ${wanted
+        } changes it on every invoice already recorded against ${who} and on every invoice after this one.`
+      : `${who} has no account yet. ${wanted} becomes their number when you save, and stays their number on every invoice after this one.`,
+    'Change the number');
+    if (!ok) { box.value = was; return; }
+
+    supno.number = wanted;
+    supno.settled = wanted;
+    supno.source = 'manual';
+    supno.conflict = null;
+    supno.renumber = true;
+    showPending();
+  });
 
   drop.addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', (e) => take(e.target.files[0]));
@@ -2033,7 +2136,11 @@ async function viewNewDeal(direction) {
         ...sheet,
         // Only a number the account can actually take: one already belonging
         // to someone else was rejected at preview and must not arrive here.
-        party_no: supno.source === 'taken' ? '' : (supno.number || sheet.party_no || ''),
+        // Claim the number the preview showed. If the sheet's own number
+        // turned out to belong to someone else, claim nothing and let the
+        // database issue a fresh one rather than passing on a code we know
+        // is taken.
+        party_no: supno.number || (supno.source === 'taken' ? '' : (sheet.party_no || '')),
         invoice_no: String(f.get('invoice_no') || '').trim() || sheet.invoice_no || '',
         total: pending.reduce((a, it) => a + it.qty * it.unit_price, 0),
       };
@@ -2043,6 +2150,20 @@ async function viewNewDeal(direction) {
       } catch (err) {
         // The order itself is already created, so this must not lose it.
         toast(`Order created, but its invoice details could not be saved: ${errText(err)}`, 'err');
+      }
+
+      /* A number typed over the one the preview settled on renames the account
+       * itself, which ensure_supplier_no deliberately will not do — it keeps
+       * whatever is on file. The confirmation box said this would follow the
+       * account onto every invoice, so this is where that happens.
+       */
+      if (supno.renumber && deal.party_id && supno.number) {
+        try {
+          await api.setSupplierNo(deal.party_id, supno.number);
+          saved.push(`supplier number set to ${supno.number}`);
+        } catch (err) {
+          toast(`Order created, but the supplier number could not be changed: ${errText(err)}`, 'err');
+        }
       }
 
       const down = Number(f.get('down_amount') || 0);
