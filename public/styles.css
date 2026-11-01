@@ -490,6 +490,12 @@ textarea { resize: vertical; min-height: 62px; }
 
 .table-scroll { overflow-x: auto; }
 
+/* A grid or flex child defaults to min-width:auto, so a wide table stretches its
+   container instead of scrolling inside it — in the modal that pushed the last
+   column out past the edge with no way to reach it. Letting these shrink to zero
+   hands the overflow back to .table-scroll, which is what scrolls. */
+.modal-body > *, .card-body > * { min-width: 0; }
+
 table.data { width: 100%; border-collapse: collapse; font-size: 14px; }
 
 table.data th, table.data td { padding: 11px 14px 11px 0; text-align: left; border-bottom: 1px solid var(--rule); }
@@ -587,6 +593,11 @@ table.data tfoot tr:last-child td { font-weight: 600; color: var(--ink); font-si
 /* Import previews list every row; the area scrolls so the mapping controls and
    the Import button stay in place while the list is checked. */
 .preview-scroll { max-height: 46vh; overflow: auto; }
+
+/* Keep the columns at a readable width and scroll sideways instead of crushing
+   Description until Qty, Price and Amount have nowhere left to go. */
+.preview-scroll > table.data { min-width: 760px; }
+.preview-scroll td.desc { min-width: 240px; }
 .preview-scroll thead th {
   position: sticky; top: 0; z-index: 1;
   background: var(--surface);
@@ -820,3 +831,8 @@ a.uid-chip:hover { text-decoration: underline; }
   max-width: 62ch;
   white-space: pre-wrap;
 }
+
+/* Inside a scrolling preview the vertical scrollbar sits where the table's own
+   right edge is, so the last column needs a little room to clear it. */
+.preview-scroll table.data th:last-child,
+.preview-scroll table.data td:last-child { padding-right: 6px; }
