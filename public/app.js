@@ -5206,9 +5206,10 @@ function partyDialog(p, done) {
     body: `<form id="f" class="grid-form">
       <label class="field wide"><span>Name</span>
         <input name="name" value="${esc(p.name)}" required></label>
-      <label class="field"><span>${word} number <em>(their code)</em></span>
+      <label class="field"><span>${word} number <em>(your account number for them)</em></span>
         <input name="supplier_no" value="${esc(p.supplier_no || '')}"
-          placeholder="e.g. SUP-0012" autocapitalize="characters" spellcheck="false"></label>
+          placeholder="e.g. SUP-000012" autocapitalize="characters" spellcheck="false">
+        <small class="hint">One account, one number. Leave it alone unless it is wrong — clearing the box keeps the number already on file.</small></label>
       <label class="field"><span>Kind</span>
         <select name="kind">${['supplier', 'customer', 'both'].map((k) =>
           `<option value="${k}"${k === p.kind ? ' selected' : ''}>${KIND_TEXT[k]}</option>`).join('')}</select></label>
@@ -5225,16 +5226,37 @@ function partyDialog(p, done) {
     const f = new FormData($('#f', m));
     const name = String(f.get('name') || '').trim();
     if (!name) return toast('An account needs a name.', 'err');
+    const wanted = String(f.get('supplier_no') || '').trim();
+
+    const patch = {
+      name,
+      kind: f.get('kind'),
+      details: String(f.get('details') || '').trim() || null,
+      notes: String(f.get('notes') || '').trim() || null,
+    };
+    /* An account must never end up unnumbered, so an emptied box keeps what
+     * is on file rather than wiping it. Blanking a number is not a thing you
+     * can mean — every account needs one. */
+    if (wanted) patch.supplier_no = wanted;
+
     try {
-      await api.updateParty(p.id, {
-        name,
-        kind: f.get('kind'),
-        supplier_no: String(f.get('supplier_no') || '').trim() || null,
-        details: String(f.get('details') || '').trim() || null,
-        notes: String(f.get('notes') || '').trim() || null,
-      });
+      await api.updateParty(p.id, patch);
       closeModal(); toast('Saved', 'ok'); done();
-    } catch (e) { toast(errText(e), 'err'); }
+    } catch (e) {
+      /* The unique index is what stops two accounts sharing a number. Say
+       * whose it is rather than showing the raw constraint name. */
+      if (/parties_supplier_no_uq|duplicate key/i.test(String(e?.message || ''))) {
+        let owner = '';
+        try {
+          const { parties } = await api.parties();
+          const clash = parties.find((x) => x.id !== p.id
+            && String(x.supplier_no || '').trim().toLowerCase() === wanted.toLowerCase());
+          if (clash) owner = ` — it belongs to ${clash.name}`;
+        } catch { /* the message below still says enough */ }
+        return toast(`${wanted} is already in use${owner}. One account holds one number, so pick another.`, 'err');
+      }
+      toast(errText(e), 'err');
+    }
   };
 }
 
