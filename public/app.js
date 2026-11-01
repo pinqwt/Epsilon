@@ -108,6 +108,15 @@ const esc = (s) =>
 
 const decOf = (cur) => CUR_DEC[String(cur || '').toUpperCase()] ?? 2;
 
+/* Round a money figure to a fixed number of decimals, the way the database
+ * rounds it. Postgres works in exact decimal and rounds half away from zero;
+ * toFixed is the closest JavaScript gets, and agrees with it on every figure
+ * that came off a price list. (A binary half such as 2.675 is already 2.67499
+ * in a double before anything rounds it, so the two can differ by one unit in
+ * the last place; that is why nothing is ever settled on a figure computed
+ * here alone -- deal_summary recomputes the bill from the stored rows.) */
+const roundTo = (n, d) => Number((Number(n) || 0).toFixed(d));
+
 /** 1234.5 KWD -> "1,234.500" */
 function fmt(n, cur, dec) {
   const d = dec ?? decOf(cur);
@@ -1883,6 +1892,10 @@ async function viewNewDeal(direction) {
       </div>
       <div class="card-body" style="padding-top:16px">
         <div class="grid-form">
+          <label class="check wide">
+            <input type="checkbox" name="down_full" id="down-full">
+            Fully paid — ${direction === 'receiving' ? 'the customer paid' : 'you paid'} the whole bill up front
+          </label>
           <label class="field">
             <span>Amount <em>(leave blank if none)</em></span>
             <input name="down_amount" type="number" step="0.001" min="0" placeholder="0">
@@ -1895,6 +1908,7 @@ async function viewNewDeal(direction) {
             <span>Method <em>(optional)</em></span>
             <input name="down_method" placeholder="TT, cash, cheque">
           </label>
+          <p class="preview-note wide" id="down-full-note" style="margin:0;display:none"></p>
         </div>
       </div>
       <div class="card-head" style="border-top:1px solid var(--rule);border-bottom:0">
@@ -1955,6 +1969,8 @@ async function viewNewDeal(direction) {
            </tr></tfoot>
          </table></div>`
       : '';
+    // The bill just changed, so a "fully paid" amount has to change with it.
+    syncFullyPaid();
   };
 
   /* Say which number the import settled on and why, because the quiet cases
@@ -1988,6 +2004,43 @@ async function viewNewDeal(direction) {
       ? `<p class="preview-note" style="margin:0">New supplier — <strong>${
           esc(supno.number)}</strong>, which is theirs once you save. No two accounts can share a number.</p>`
       : `<p class="preview-note" style="margin:0">New supplier — a number is assigned when you save, so no two accounts can share one.</p>`;
+  };
+
+  /* What the order will be billed at, worked out the same way deal_summary
+   * works it out: each line is stored rounded to four decimals, the discount
+   * comes off the subtotal, and the result is rounded to the currency's own
+   * decimals. Matching it matters -- "fully paid" has to land on exactly zero
+   * left, not on a tenth of a fils still owing. */
+  const billNow = () => {
+    const cur = $('#new-form [name=currency]')?.value || 'KWD';
+    const pct = Number($('#new-form [name=discount_pct]')?.value || 0);
+    const sub = pending.reduce((a, it) => a + roundTo(it.qty * it.unit_price, 4), 0);
+    return roundTo(sub - (sub * pct) / 100, decOf(cur));
+  };
+
+  /* "Fully paid" is a statement about the whole bill, so the amount follows
+   * the item list rather than being typed once and left behind: importing a
+   * sheet or changing the discount moves it. The box is locked while it is
+   * ticked, because a figure that disagrees with the bill is the one thing
+   * this option exists to prevent. */
+  const syncFullyPaid = () => {
+    const box = $('#down-full');
+    const amt = $('#new-form [name=down_amount]');
+    const note = $('#down-full-note');
+    if (!box || !amt || !note) return;
+    const cur = $('#new-form [name=currency]')?.value || 'KWD';
+    if (!box.checked) {
+      amt.readOnly = false;
+      note.style.display = 'none';
+      return;
+    }
+    const bill = billNow();
+    amt.readOnly = true;
+    amt.value = bill ? String(bill) : '';
+    note.style.display = '';
+    note.innerHTML = pending.length
+      ? `Paying the whole bill — <strong>${esc(money(bill, cur, decOf(cur)))}</strong>, so this order is settled the moment it is created.`
+      : 'No items yet, so there is no bill to pay in full. Attach the price list and this fills itself in.';
   };
 
   const supNoInput = () => $('#new-form [name=party_no]');
@@ -2104,6 +2157,10 @@ async function viewNewDeal(direction) {
     showPending();
   });
 
+  $('#down-full')?.addEventListener('change', syncFullyPaid);
+  $('#new-form [name=discount_pct]')?.addEventListener('input', syncFullyPaid);
+  $('#new-form [name=currency]')?.addEventListener('change', syncFullyPaid);
+
   drop.addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', (e) => take(e.target.files[0]));
   drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('is-over'); });
@@ -2166,21 +2223,27 @@ async function viewNewDeal(direction) {
         }
       }
 
-      const down = Number(f.get('down_amount') || 0);
+      // Fully paid means the whole bill, worked out now rather than trusted
+      // from the box: the discount or the item list may have moved since it
+      // was last filled in, and a stale figure would leave a few fils owing.
+      const full = !!f.get('down_full');
+      const down = full ? billNow() : Number(f.get('down_amount') || 0);
       if (down > 0) {
         await api.addPayment({
           deal_id: deal.id,
           amount: down,
           paid_on: f.get('down_date') || todayISO(),
           method: String(f.get('down_method') || '').trim(),
-          note: 'Down payment',
+          note: full ? 'Paid in full' : 'Down payment',
           is_down_payment: true,
         });
       }
 
       const bits = [
         pending.length ? `${pending.length} items imported` : 'no items yet',
-        down > 0 ? `down payment ${money(down, f.get('currency'))} recorded` : null,
+        down > 0
+          ? `${full ? 'paid in full' : 'down payment'} ${money(down, f.get('currency'))} recorded`
+          : null,
         ...saved,
       ].filter(Boolean);
       toast(`${deal.reference} created — ${bits.join(', ')}`, 'ok');
@@ -5329,7 +5392,7 @@ function partyDialog(p, done) {
         <input name="name" value="${esc(p.name)}" required></label>
       <label class="field"><span>${word} number <em>(your account number for them)</em></span>
         <input name="supplier_no" value="${esc(p.supplier_no || '')}"
-          placeholder="e.g. SUP-000012" autocapitalize="characters" spellcheck="false">
+          placeholder="e.g. SUP0012" autocapitalize="characters" spellcheck="false">
         <small class="hint">One account, one number. Leave it alone unless it is wrong — clearing the box keeps the number already on file.</small></label>
       <label class="field"><span>Kind</span>
         <select name="kind">${['supplier', 'customer', 'both'].map((k) =>

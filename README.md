@@ -76,7 +76,7 @@ the same value on every row — the value used on the most rows is the one taken
 
 **Supplier Details holds the supplier's own contact details** — their phone,
 their address, their email — never Epsilon's. **Supplier Number** is the
-account or reference code for that supplier, such as `SUP-0012`.
+account or reference code for that supplier, such as `SUP0012` — three letters, then four digits.
 
 When an invoice names a supplier who has no number or details on file yet, both
 are saved onto their account, so the first invoice from a new supplier is what
