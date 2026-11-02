@@ -72,3 +72,14 @@ down payment, paid and left to pay. Full user-facing docs are in `README.md`.
 - **Every view needs `security_invoker = true`**, set in the migration that creates it. Without it the view reads its base tables with the view *owner's* rights, RLS never runs, and the view is readable by anyone holding the publishable key — the table's own policies do not save it. This was a real hole, caught 2026-10-29: the four views added by the ERP work (`activity_log`, `general_ledger`, `order_progress`, `stock_on_hand`) all lacked it, and `order_progress` served all 19 purchase lines to an anonymous caller. Three read empty at the time, so nothing looked wrong; `general_ledger` would have gone public with the first posted journal. The query to check for regressions is in `supabase/migrations/README.md`.
 - Don't paste real passwords or the service-role key into chat or files; only the publishable key belongs in `CONFIG`.
 - The README tells the owner to change any password they previously typed into a chat window.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- When graphify-out/graph.json exists, run `graphify query "<question>"` before your first grep, search or source-file read for a codebase question, and put this rule in every subagent prompt that explores code. Read raw files only for lines the graph or an earlier read already located. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+- A committed graphify-out/graph.json is rewritten whole on every build, so a large diff to it in a pull request is expected. Do not flag it as churn or suggest skipping the graph rebuild or its hooks.
