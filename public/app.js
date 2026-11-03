@@ -330,6 +330,7 @@ async function callUsersFn(payload) {
 
 // There is one company and one warehouse; looked up once, then remembered.
 let _erpDefaults = null;
+let _company = null;
 
 const api = {
   async totals() {
@@ -894,6 +895,187 @@ const api = {
   async postCreditNote(id) {
     const { error } = await sb.rpc('post_credit_note', { p_note: id });
     if (error) throw error;
+  },
+
+  /* ----------------------- phase 4: money in and out --------------------
+   * Two payment paths live side by side on purpose. The older Add payment
+   * box inserts without a status, so the column default makes it 'legacy':
+   * it stays out of the ledger and deal_summary counts it on its own, so
+   * "left to pay" drops the moment it is recorded. Everything below creates
+   * a 'draft' instead and settles it through preview_payment / post_payment,
+   * which is what writes the journal. A client can never insert 'posted'.
+   */
+  /* The money screens need the company and its base currency, but not a
+   * warehouse: no goods move when money does, so erpDefaults' insistence on
+   * one would turn away a perfectly good payment.
+   */
+  async company() {
+    if (_company) return _company;
+    const { data, error } = await sb.from('companies')
+      .select('id, code, name, base_currency').limit(1).maybeSingle();
+    if (error) throw error;
+    if (!data) throw new Error('No company is set up yet, so there is no ledger for money to move through.');
+    _company = data;
+    return data;
+  },
+
+  async baseCurrency() {
+    return (await api.company()).base_currency;
+  },
+
+  async banks() {
+    const { data, error } = await sb.from('bank_accounts')
+      .select('*').eq('active', true).order('code');
+    if (error) throw error;
+    return data || [];
+  },
+
+  /* Rates are held base-per-1-foreign (KWD per 1 USD), newest first, which
+   * is the order fx_rate_for reads them in.
+   */
+  async fxRates() {
+    const { data, error } = await sb.from('fx_rates').select('*')
+      .order('currency').order('rate_date', { ascending: false });
+    if (error) throw error;
+    return data || [];
+  },
+
+  async addFxRate(row) {
+    const { data: { user } } = await sb.auth.getUser();
+    const { error } = await sb.from('fx_rates').insert({ ...row, created_by: user?.id || null });
+    if (error) throw error;
+  },
+
+  async bankBalances() {
+    const { data, error } = await sb.from('bank_balances').select('*').order('code');
+    if (error) throw error;
+    return data || [];
+  },
+
+  async arAging() {
+    const { data, error } = await sb.from('ar_aging').select('*').order('party_name');
+    if (error) throw error;
+    return data || [];
+  },
+
+  async apAging() {
+    const { data, error } = await sb.from('ap_aging').select('*').order('party_name');
+    if (error) throw error;
+    return data || [];
+  },
+
+  async customerOpenItems() {
+    const { data, error } = await sb.from('customer_open_items')
+      .select('*').order('due_date', { nullsFirst: false });
+    if (error) throw error;
+    return (data || []).filter((r) => Number(r.outstanding) > 0);
+  },
+
+  async supplierOpenItems() {
+    const { data, error } = await sb.from('supplier_open_items')
+      .select('*').order('due_date', { nullsFirst: false });
+    if (error) throw error;
+    return data || [];
+  },
+
+  async customerAdvances() {
+    const { data, error } = await sb.from('customer_advances').select('*').order('party_name');
+    if (error) throw error;
+    return data || [];
+  },
+
+  async supplierAdvances() {
+    const { data, error } = await sb.from('supplier_advances').select('*').order('party_name');
+    if (error) throw error;
+    return data || [];
+  },
+
+  /* Every payment with the order and the account it belongs to, so the
+   * receipts and payments screens read without a second lookup. Both
+   * directions come back together and are split in the browser: the volume
+   * is tiny, and filtering on an embedded column is easy to get wrong.
+   */
+  async moneyRows() {
+    const { data, error } = await sb.from('payments')
+      .select(`*, deal:deals!inner(
+                 id, reference, direction, currency, doc_no, party_id,
+                 party:parties(name, sup_code, cus_code, supplier_no))`)
+      .order('paid_on', { ascending: false })
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    return data || [];
+  },
+
+  /* A draft receipt or payment. company_id is filled in here because
+   * payment_plan needs a company to find the ledger and the base currency.
+   */
+  async saveDraftPayment(fields) {
+    const company = await api.company();
+    const row = {
+      deal_id: fields.deal_id,
+      amount: fields.amount,
+      paid_on: fields.paid_on,
+      method: fields.method || '',
+      note: fields.note || '',
+      bank_account_id: fields.bank_account_id || null,
+      bank_amount: fields.bank_amount ?? null,
+      fx_rate: fields.fx_rate ?? null,
+      rate_date: fields.rate_date || null,
+    };
+    if (fields.id) {
+      const { error } = await sb.from('payments').update(row).eq('id', fields.id);
+      if (error) throw error;
+      return fields.id;
+    }
+    const { data, error } = await sb.from('payments')
+      .insert({ ...row, company_id: company.id, status: 'draft', is_down_payment: false })
+      .select('id').single();
+    if (error) throw error;
+    return data.id;
+  },
+
+  async allocations(paymentId) {
+    const { data, error } = await sb.from('payment_allocations')
+      .select('*').eq('payment_id', paymentId);
+    if (error) throw error;
+    return data || [];
+  },
+
+  /* Allocations are rewritten whole rather than patched: the set is small,
+   * and the policy only lets them move while the payment is still a draft.
+   */
+  async setAllocations(paymentId, rows) {
+    const del = await sb.from('payment_allocations').delete().eq('payment_id', paymentId);
+    if (del.error) throw del.error;
+    const keep = rows.filter((r) => Number(r.amount) > 0);
+    if (!keep.length) return;
+    const { error } = await sb.from('payment_allocations').insert(
+      keep.map((r) => ({
+        payment_id: paymentId,
+        sales_invoice_id: r.sales_invoice_id || null,
+        invoice_id: r.invoice_id || null,
+        deal_id: r.deal_id || null,
+        amount: r.amount,
+      })));
+    if (error) throw error;
+  },
+
+  async previewPayment(id) {
+    const { data, error } = await sb.rpc('preview_payment', { p_payment: id });
+    if (error) throw error;
+    return data || [];
+  },
+
+  async postPayment(id, memo = '') {
+    const { data, error } = await sb.rpc('post_payment', { p_payment: id, p_memo: memo });
+    if (error) throw error;
+    return data;
+  },
+
+  async reversePayment(id, reason) {
+    const { data, error } = await sb.rpc('reverse_payment', { p_payment: id, p_reason: reason });
+    if (error) throw error;
+    return Number(data || 0);
   },
 
   /* What this order has promised, sent and billed, line by line. */
@@ -1712,6 +1894,19 @@ function setLoading() {
   view().innerHTML = '<div class="empty"><div class="spinner" style="margin:0 auto 12px"></div>Loading…</div>';
 }
 
+/* #view is refilled on every render but never replaced, so a listener added
+ * with addEventListener on each visit piles up: visit the same page twice and
+ * one click runs the handler twice, against a stale copy of the record it
+ * closed over. That is harmless for a reload and not at all harmless for
+ * posting. One handler slot, replaced each time the page is drawn.
+ */
+function onView(handler) {
+  const el = view();
+  if (el._onView) el.removeEventListener('click', el._onView);
+  el._onView = handler;
+  el.addEventListener('click', handler);
+}
+
 async function viewHome() {
   setLoading();
   const all = await api.deals({ limit: 500 });
@@ -2425,32 +2620,46 @@ async function viewDeal(id) {
       <div class="card-head">
         <h3>${d.direction === 'receiving' ? 'Payments received' : 'Payments made'}</h3>
         <div class="spacer"></div>
-        ${canEdit() ? '<button class="btn btn-sm btn-accent" data-act="add-payment" type="button">Record payment</button>' : ''}
+        ${canEdit() ? `
+          <button class="btn btn-sm" data-act="ledger-money" type="button">${
+            d.direction === 'receiving' ? 'Collect through the ledger' : 'Pay through the ledger'}</button>
+          <button class="btn btn-sm btn-accent" data-act="add-payment" type="button">Record payment</button>` : ''}
       </div>
       <div class="card-body tight">
         ${payments.length ? `
           <div class="table-scroll"><table class="data">
             <thead><tr>
-              <th>Date</th><th>Method</th><th>Note</th><th class="r">Amount</th>
+              <th>Date</th><th>Number</th><th>Method</th><th>Note</th><th class="r">Amount</th>
               <th class="r">${esc(dir.word)} account</th><th class="r">Your account</th>
-              ${canEdit() ? '<th></th>' : ''}
+              <th>Status</th>${canEdit() ? '<th></th>' : ''}
             </tr></thead>
             <tbody>
-              ${payments.map((p) => `<tr>
+              ${payments.map((p) => {
+                // A draft has not happened and a reversed one no longer has, so
+                // neither moves an account: deal_summary counts legacy and
+                // posted rows only, and these columns must agree with it.
+                const counts = p.status === 'legacy' || p.status === 'posted';
+                const nil = '<span class="dim">—</span>';
+                return `<tr>
                 <td>${esc(dateLabel(p.paid_on))}</td>
+                <td class="sku">${esc(p.doc_no || '—')}</td>
                 <td>${esc(p.method || '—')} ${p.is_down_payment ? '<span class="tag tag-down">Down payment</span>' : ''}</td>
                 <td class="desc">${esc(p.note || '')}</td>
                 <td class="r">${fmt(p.amount, d.currency, dec)}</td>
-                <td class="r"><span class="entry-${out ? 'cr' : 'dr'}">${out ? 'Credited' : 'Debited'} ${fmt(p.amount, d.currency, dec)}</span></td>
-                <td class="r"><span class="entry-${out ? 'dr' : 'cr'}">${out ? 'Debited' : 'Credited'} ${fmt(p.amount, d.currency, dec)}</span></td>
-                ${canEdit() ? `<td class="act"><button class="btn btn-ghost btn-sm" data-act="del-payment" data-id="${p.id}" type="button">✕</button></td>` : ''}
-              </tr>`).join('')}
+                <td class="r">${counts ? `<span class="entry-${out ? 'cr' : 'dr'}">${out ? 'Credited' : 'Debited'} ${fmt(p.amount, d.currency, dec)}</span>` : nil}</td>
+                <td class="r">${counts ? `<span class="entry-${out ? 'dr' : 'cr'}">${out ? 'Debited' : 'Credited'} ${fmt(p.amount, d.currency, dec)}</span>` : nil}</td>
+                <td>${payChip(p.status)}${p.status === 'reversed' && p.reverse_reason
+                  ? `<div class="dim" style="font-size:12px">${esc(p.reverse_reason)}</div>` : ''}</td>
+                ${canEdit() ? `<td class="act">${dealPayActions(p)}</td>` : ''}
+              </tr>`;
+              }).join('')}
             </tbody>
             <tfoot><tr>
-              <td colspan="3" class="r">Total paid</td>
+              <td colspan="4" class="r">Total paid</td>
               <td class="r">${fmt(d.paid, d.currency, dec)}</td>
               <td class="r">${fmt(d.paid, d.currency, dec)}</td>
               <td class="r">${fmt(d.paid, d.currency, dec)}</td>
+              <td></td>
               ${canEdit() ? '<td></td>' : ''}
             </tr></tfoot>
           </table></div>
@@ -2458,6 +2667,12 @@ async function viewDeal(id) {
             ${d.direction === 'sending'
               ? `Money you send credits the ${esc(dir.word.toLowerCase())}’s account and debits yours, leaving them holding value until the goods arrive.`
               : `Money the customer sends debits their account and credits yours, leaving you holding value until you deliver.`}
+            ${payments.some((p) => p.status === 'draft' || p.status === 'reversed')
+              ? ' A draft is not counted in the total until it is posted, and a reversed one is no longer counted.'
+              : ''}
+            ${payments.some((p) => p.status === 'legacy')
+              ? ' Rows marked “not in the ledger” were recorded with <strong>Record payment</strong>, which counts towards what is left to pay but writes no journal.'
+              : ''}
           </p>`
           : `<div class="empty">No payments recorded yet.</div>`}
       </div>
@@ -3639,7 +3854,7 @@ async function paintHistory(d) {
 function wireDealActions(d, invoices) {
   const reload = () => viewDeal(d.id);
 
-  view().addEventListener('click', async (e) => {
+  onView(async (e) => {
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
     const act = btn.dataset.act;
@@ -3665,6 +3880,50 @@ function wireDealActions(d, invoices) {
       if (act === 'del-payment') {
         if (!await confirmAction('Delete this payment?', 'Delete')) return;
         await api.deletePayment(btn.dataset.id); toast('Payment deleted', 'ok'); return reload();
+      }
+
+      /* ---- money through the ledger. The older Record payment box still
+       * writes a legacy row that posts nothing; these go through
+       * post_payment, which is what writes the journal. ---- */
+      if (act === 'ledger-money') {
+        return moneyDialog({
+          side: d.direction === 'receiving' ? 'customer' : 'supplier',
+          deal: d,
+          done: reload,
+        });
+      }
+      if (act === 'pay-edit') {
+        const { payments } = await api.deal(d.id);
+        const p = payments.find((x) => x.id === btn.dataset.id);
+        if (!p) { toast('That payment is no longer there', 'err'); return reload(); }
+        return moneyDialog({
+          side: d.direction === 'receiving' ? 'customer' : 'supplier',
+          deal: d,
+          payment: p,
+          done: reload,
+        });
+      }
+      if (act === 'pay-post') {
+        if (!await confirmAction(
+          d.direction === 'receiving'
+            ? 'Post this receipt? It writes the journal and reduces what the customer owes. Afterwards it can only be reversed, never edited.'
+            : 'Post this payment? It writes the journal as a supplier advance and takes the money out of the bank. Afterwards it can only be reversed, never edited.',
+          'Post')) return;
+        await api.postPayment(btn.dataset.id);
+        toast('Posted', 'ok');
+        return reload();
+      }
+      if (act === 'pay-reverse') {
+        const why = await askWhy({
+          title: 'Reverse this payment',
+          message: 'Reversing writes a mirror journal that cancels this one. Both stay on file and both stay in every balance, because the pair nets to zero — a reversal means corrected, not never happened.',
+          confirmLabel: 'Reverse it',
+          placeholder: 'e.g. wrong bank account, duplicate entry',
+        });
+        if (why === null) return;
+        const n = await api.reversePayment(btn.dataset.id, why);
+        toast(`Reversed — ${n} journal${n === 1 ? '' : 's'} cancelled`, 'ok');
+        return reload();
       }
       if (act === 'del-invoice') {
         const inv = invoices.find((i) => i.id === btn.dataset.id);
@@ -3812,6 +4071,27 @@ function itemDialog(d, done) {
       closeModal(); toast('Item added', 'ok'); done();
     } catch (e) { toast(errText(e), 'err'); }
   };
+}
+
+/* The payments card on an order carries both paths at once. A legacy row from
+ * the older box simply goes; a ledger payment follows its lifecycle instead.
+ * A posted one is never offered a delete: the policy would refuse it, and an
+ * UPDATE or DELETE that fails `using` affects zero rows rather than raising,
+ * so the button would silently appear to do nothing.
+ */
+function dealPayActions(p) {
+  if (p.status === 'draft') {
+    return `<button class="btn btn-ghost btn-sm" data-act="pay-edit" data-id="${p.id}" type="button">Edit</button>
+            <button class="btn btn-sm" data-act="pay-post" data-id="${p.id}" type="button">Post</button>
+            <button class="btn btn-ghost btn-sm" data-act="del-payment" data-id="${p.id}" type="button">✕</button>`;
+  }
+  if (p.status === 'posted') {
+    return isOwner()
+      ? `<button class="btn btn-ghost btn-sm" data-act="pay-reverse" data-id="${p.id}" type="button">Reverse</button>`
+      : '';
+  }
+  if (p.status === 'reversed') return '';
+  return `<button class="btn btn-ghost btn-sm" data-act="del-payment" data-id="${p.id}" type="button">✕</button>`;
 }
 
 function paymentDialog(d, done) {
@@ -5506,7 +5786,7 @@ async function viewUsers() {
 
   $('#add-user').onclick = () => userDialog(viewUsers);
 
-  view().addEventListener('click', async (e) => {
+  onView(async (e) => {
     const btn = e.target.closest('[data-u-act]');
     if (!btn) return;
     const tr = btn.closest('[data-user]');
@@ -5757,6 +6037,1151 @@ function fxDialog() {
   paint();
 }
 
+/* ===================== money in and out (phase 4) ======================
+ *
+ * Spec pages 25 and 26: a customer receipt and a supplier payment. Both are
+ * saved as a draft first, previewed, and only then posted — posting is what
+ * writes the journal, and a posted payment can never be edited afterwards,
+ * only reversed. Three things are deliberately kept apart on these screens,
+ * because collapsing any two of them is how the ledger starts lying:
+ *
+ *  * Collecting money reduces what a customer owes. It is not another sale.
+ *  * Money with no bill behind it is an advance — held on 2200 for a customer
+ *    and 1400 for a supplier — not netted off a balance that does not exist.
+ *  * A supplier payment cannot be applied to a bill until supplier invoice
+ *    matching (PIN) lands, which is the unfinished part of phase 2. So it
+ *    posts as an advance and the screen says so, rather than clearing a
+ *    payable that was never posted.
+ *
+ * The arithmetic shown here mirrors private.payment_plan, but nothing is
+ * settled on it: Preview journal asks the database, and posting reads the
+ * same plan again, so what the owner sees and what lands cannot drift.
+ */
+
+const PAY_STATUS = {
+  legacy: ['Not in the ledger', ''],
+  draft: ['Draft', ''],
+  posted: ['Posted', 'grn-posted'],
+  reversed: ['Reversed', 'grn-cancelled'],
+};
+
+const AGE_BUCKETS = [
+  ['not_due', 'Not due'],
+  ['overdue_1_30', '1–30 days'],
+  ['overdue_31_60', '31–60 days'],
+  ['overdue_61_90', '61–90 days'],
+  ['overdue_over_90', 'Over 90 days'],
+];
+
+function payChip(status) {
+  const [label, cls] = PAY_STATUS[status] || [status, ''];
+  return `<span class="grn-chip ${cls}">${esc(label)}</span>`;
+}
+
+const overdueOf = (r) => AGE_BUCKETS.slice(1).reduce((s, [k]) => s + Number(r[k] || 0), 0);
+
+/* Outstanding money cannot be added across currencies, so every total is
+ * given per currency rather than as one meaningless number.
+ */
+function agingTotals(rows, countKey) {
+  const m = new Map();
+  for (const r of rows) {
+    const t = m.get(r.currency) || {
+      currency: r.currency, dec: r.cur_decimals, total: 0, overdue: 0, count: 0, parties: 0,
+    };
+    t.total += Number(r.total_outstanding || 0);
+    t.overdue += overdueOf(r);
+    t.count += Number(r[countKey] || 0);
+    t.parties += 1;
+    m.set(r.currency, t);
+  }
+  return [...m.values()];
+}
+
+function moneyTile(t, side) {
+  return `
+    <div class="tile tile-${side === 'customer' ? 'in' : 'out'} ${t.overdue > 0 ? 'tile-left-due' : 'tile-left-ok'}">
+      <div class="tile-top"><span class="tile-dot"></span>${
+        side === 'customer' ? 'Owed to you' : 'You owe'} · ${esc(t.currency)}</div>
+      <div class="tile-val">${fmt(t.total, t.currency, t.dec)}<span class="tile-cur">${esc(t.currency)}</span></div>
+      <div class="tile-sub">
+        <span><b>${fmt(t.count, null, 0)}</b> open</span>
+        <span>Overdue <b>${fmt(t.overdue, t.currency, t.dec)}</b></span>
+        <span><b>${fmt(t.parties, null, 0)}</b> account${t.parties === 1 ? '' : 's'}</span>
+      </div>
+    </div>`;
+}
+
+function agingTable(rows, side) {
+  if (!rows.length) return '<div class="empty">Nothing outstanding.</div>';
+  const countKey = side === 'customer' ? 'open_invoices' : 'open_bills';
+  const totals = agingTotals(rows, countKey);
+  return `
+    <div class="table-scroll"><table class="data">
+      <thead><tr>
+        <th>${side === 'customer' ? 'Customer' : 'Supplier'}</th><th>Account</th>
+        <th class="r">${side === 'customer' ? 'Invoices' : 'Bills'}</th>
+        ${AGE_BUCKETS.map(([, l]) => `<th class="r">${esc(l)}</th>`).join('')}
+        <th class="r">Total</th>
+      </tr></thead>
+      <tbody>
+        ${rows.map((r) => `<tr>
+          <td>${esc(r.party_name || '—')}</td>
+          <td>${r.cus_code || r.sup_code
+            ? `<span class="uid-chip">${esc(r.cus_code || r.sup_code)}</span>`
+            : '<span class="dim">—</span>'}</td>
+          <td class="r">${fmt(r[countKey], null, 0)}</td>
+          ${AGE_BUCKETS.map(([k]) => `<td class="r">${Number(r[k])
+            ? fmt(r[k], r.currency, r.cur_decimals)
+            : '<span class="dim">—</span>'}</td>`).join('')}
+          <td class="r"><b>${fmt(r.total_outstanding, r.currency, r.cur_decimals)}</b> ${esc(r.currency)}</td>
+        </tr>`).join('')}
+      </tbody>
+      <tfoot>
+        ${totals.map((t) => `<tr>
+          <td colspan="2" class="r">Total ${esc(t.currency)}</td>
+          <td class="r">${fmt(t.count, null, 0)}</td>
+          <td class="r" colspan="5">${t.overdue > 0
+            ? `${fmt(t.overdue, t.currency, t.dec)} overdue`
+            : 'none overdue'}</td>
+          <td class="r"><b>${fmt(t.total, t.currency, t.dec)}</b> ${esc(t.currency)}</td>
+        </tr>`).join('')}
+      </tfoot>
+    </table></div>`;
+}
+
+/* Advances are shown on their own, never netted off an aging total: an
+ * advance is money held with no bill behind it, which is a ledger balance
+ * and not an open item (spec page 8).
+ */
+function advanceTable(rows, side, base) {
+  if (!rows.length) return '';
+  const dec = decOf(base);
+  const total = rows.reduce((s, r) => s + Number(r.advance_base || 0), 0);
+  return `
+    <div class="table-scroll"><table class="data">
+      <thead><tr><th>${side === 'customer' ? 'Customer' : 'Supplier'}</th><th>Account</th>
+        <th class="r">Held (${esc(base)})</th></tr></thead>
+      <tbody>
+        ${rows.map((r) => `<tr>
+          <td>${esc(r.party_name || '—')}</td>
+          <td>${r.cus_code || r.sup_code
+            ? `<span class="uid-chip">${esc(r.cus_code || r.sup_code)}</span>`
+            : '<span class="dim">—</span>'}</td>
+          <td class="r">${fmt(r.advance_base, base, dec)}</td>
+        </tr>`).join('')}
+      </tbody>
+      <tfoot><tr><td colspan="2" class="r">Total held</td>
+        <td class="r"><b>${fmt(total, base, dec)}</b> ${esc(base)}</td></tr></tfoot>
+    </table></div>`;
+}
+
+/* One row per receipt or payment. The actions follow the lifecycle: a draft
+ * can still be changed, a posted one can only be reversed, and a legacy row
+ * belongs to the older box and is left alone.
+ */
+function moneyList(rows, side, base) {
+  if (!rows.length) {
+    return `<div class="empty">No ${side === 'customer' ? 'receipts' : 'payments'} recorded on this screen yet.</div>`;
+  }
+  const baseDec = decOf(base);
+  return `
+    <div class="table-scroll"><table class="data">
+      <thead><tr>
+        <th>Number</th><th>Date</th><th>${side === 'customer' ? 'Customer' : 'Supplier'}</th>
+        <th>Order</th><th>Method</th>
+        <th class="r">Amount</th><th class="r">Through the bank</th>
+        <th>Status</th>${canEdit() ? '<th></th>' : ''}
+      </tr></thead>
+      <tbody>
+        ${rows.map((p) => {
+          const d = p.deal || {};
+          const dec = decOf(d.currency);
+          return `<tr>
+            <td class="sku">${esc(p.doc_no || '—')}</td>
+            <td>${esc(dateLabel(p.paid_on))}</td>
+            <td>${esc(d.party?.name || '—')}</td>
+            <td><a href="#/deal/${d.id}">${esc(d.reference || d.doc_no || 'open')}</a></td>
+            <td>${esc(p.method || '—')}</td>
+            <td class="r">${fmt(p.amount, d.currency, dec)} ${esc(d.currency || '')}</td>
+            <td class="r">${p.bank_amount != null
+              ? `${fmt(p.bank_amount, base, baseDec)} ${esc(base)}`
+              : '<span class="dim">—</span>'}</td>
+            <td>${payChip(p.status)}${p.status === 'reversed' && p.reverse_reason
+              ? `<div class="dim" style="font-size:12px">${esc(p.reverse_reason)}</div>` : ''}${
+              p.status === 'legacy'
+                ? '<div class="dim" style="font-size:12px">recorded on the order page</div>' : ''}</td>
+            ${canEdit() ? `<td class="act">${moneyActions(p)}</td>` : ''}
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>
+    <p class="preview-note" style="padding:10px 12px;margin:0">
+      A draft has not happened yet — it is left out of every balance until it is posted.
+      Posting writes the journal; after that the record can only be reversed, which leaves
+      both the original and the entry that cancels it on file.
+    </p>`;
+}
+
+function moneyActions(p) {
+  if (p.status === 'draft') {
+    return `<button class="btn btn-ghost btn-sm" data-money="edit" data-id="${p.id}" type="button">Edit</button>
+            <button class="btn btn-sm" data-money="post" data-id="${p.id}" type="button">Post</button>
+            <button class="btn btn-ghost btn-sm" data-money="delete" data-id="${p.id}" type="button">✕</button>`;
+  }
+  if (p.status === 'posted' && isOwner()) {
+    return `<button class="btn btn-ghost btn-sm" data-money="reverse" data-id="${p.id}" type="button">Reverse</button>`;
+  }
+  return '';
+}
+
+/* The journal the database says it would write. Debit and credit are shown
+ * side by side and totalled, because a journal that does not balance is
+ * refused at the moment of posting — better to see that before clicking.
+ */
+function journalTable(lines, base) {
+  if (!lines.length) return '<div class="empty">Nothing would be posted.</div>';
+  const dec = decOf(base);
+  const dr = lines.reduce((s, l) => s + Number(l.debit || 0), 0);
+  const cr = lines.reduce((s, l) => s + Number(l.credit || 0), 0);
+  const level = roundTo(dr - cr, dec) === 0;
+  return `
+    <h4 style="margin:16px 0 8px;font-size:14px">Journal this would post</h4>
+    <div class="table-scroll"><table class="data">
+      <thead><tr><th>Account</th><th>Name</th><th>Memo</th>
+        <th class="r">Debit</th><th class="r">Credit</th></tr></thead>
+      <tbody>
+        ${lines.map((l) => `<tr>
+          <td class="sku">${esc(l.account_code)}</td>
+          <td>${esc(l.account_name || '')}</td>
+          <td class="desc">${esc(l.memo || '')}</td>
+          <td class="r">${Number(l.debit) ? fmt(l.debit, base, dec) : '<span class="dim">—</span>'}</td>
+          <td class="r">${Number(l.credit) ? fmt(l.credit, base, dec) : '<span class="dim">—</span>'}</td>
+        </tr>`).join('')}
+      </tbody>
+      <tfoot><tr>
+        <td colspan="3" class="r">${level ? 'Balanced' : 'Does not balance'}</td>
+        <td class="r"><b>${fmt(dr, base, dec)}</b></td>
+        <td class="r"><b>${fmt(cr, base, dec)}</b></td>
+      </tr></tfoot>
+    </table></div>
+    ${level ? '' : `<div class="notice notice-err" style="margin-top:10px">
+      <strong>These lines do not balance.</strong> The database refuses an unbalanced journal
+      at the moment of posting, so this would be rejected. Tell the owner before going further.
+    </div>`}`;
+}
+
+/* A reason, for something that stays on file rather than disappearing.
+ * askReason is the delete wording; this one is for reversals.
+ */
+function askWhy({ title, message, label = 'Reason', confirmLabel = 'Confirm', placeholder = '' }) {
+  return new Promise((resolve) => {
+    const m = openModal({
+      title,
+      body: `<p style="margin:0 0 10px">${esc(message)}</p>
+             <label class="field"><span>${esc(label)}</span>
+               <input id="why" type="text" maxlength="200" placeholder="${esc(placeholder)}">
+             </label>`,
+      foot: `<button class="btn" data-close type="button">Cancel</button>
+             <button class="btn btn-danger" data-go type="button">${esc(confirmLabel)}</button>`,
+      width: '500px',
+    });
+    let done = false;
+    const input = m.querySelector('#why');
+    input.focus();
+    const go = () => {
+      const v = input.value.trim();
+      if (!v) { input.focus(); return; }
+      done = true; closeModal(); resolve(v);
+    };
+    m.querySelector('[data-go]').onclick = go;
+    input.onkeydown = (e) => { if (e.key === 'Enter') go(); };
+    const root = $('#modal-root');
+    const obs = new MutationObserver(() => {
+      if (root.hidden) { obs.disconnect(); if (!done) resolve(null); }
+    });
+    obs.observe(root, { attributes: true, attributeFilter: ['hidden'] });
+  });
+}
+
+/* Money always belongs to an order: payments.deal_id is not optional, and
+ * the policy checks the order exists. So the order is chosen first, on its
+ * own, rather than hidden in a dropdown on a screen full of figures.
+ */
+function pickOrder(deals, direction) {
+  const word = direction === 'receiving' ? 'sales' : 'purchase';
+  return new Promise((resolve) => {
+    let done = false;
+    const m = openModal({
+      title: direction === 'receiving' ? 'Collect against which order?' : 'Pay against which order?',
+      width: '760px',
+      body: deals.length ? `
+        <div class="table-scroll"><table class="data">
+          <thead><tr>
+            <th>${direction === 'receiving' ? 'Customer' : 'Supplier'}</th><th>Order</th><th>Date</th>
+            <th class="r">Bill</th><th class="r">Paid</th><th class="r">Left to pay</th><th></th>
+          </tr></thead>
+          <tbody>
+            ${deals.map((d) => `<tr>
+              <td>${esc(d.party)}</td>
+              <td>${esc(d.reference || '—')}</td>
+              <td>${esc(dateLabel(d.deal_date))}</td>
+              <td class="r">${fmt(d.bill_total, d.currency, d.cur_decimals)} ${esc(d.currency)}</td>
+              <td class="r">${fmt(d.paid, d.currency, d.cur_decimals)}</td>
+              <td class="r">${leftHtml(d.amount_left, d.currency, d.cur_decimals)}</td>
+              <td class="act"><button class="btn btn-sm" data-pick="${d.id}" type="button">Choose</button></td>
+            </tr>`).join('')}
+          </tbody>
+        </table></div>`
+        : `<div class="empty">There is no ${word} order to settle against yet.</div>`,
+      foot: '<button class="btn" data-close type="button">Cancel</button>',
+    });
+    m.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-pick]');
+      if (!btn) return;
+      done = true;
+      resolve(deals.find((d) => d.id === btn.dataset.pick) || null);
+    });
+    const root = $('#modal-root');
+    const obs = new MutationObserver(() => {
+      if (root.hidden) { obs.disconnect(); if (!done) resolve(null); }
+    });
+    obs.observe(root, { attributes: true, attributeFilter: ['hidden'] });
+  });
+}
+
+/* The spec's receipt and payment screen. The draft is saved before it can be
+ * previewed or posted, because both of those read the saved row: the figures
+ * on screen and the figures in the ledger then come from the same place.
+ */
+async function moneyDialog({ side, deal, payment, preAllocate, done }) {
+  const base = await api.baseCurrency();
+  const baseDec = decOf(base);
+  const allBanks = await api.banks();
+  const banks = allBanks.filter((b) => String(b.currency).toUpperCase() === String(base).toUpperCase());
+  const cur = deal.currency;
+  const dec = deal.cur_decimals ?? decOf(cur);
+  const foreign = String(cur).toUpperCase() !== String(base).toUpperCase();
+  const today = todayISO();
+  let draftId = payment?.id || null;
+
+  if (!banks.length) {
+    openModal({
+      title: 'No account for the money to move through',
+      width: '540px',
+      body: `<p style="margin:0">Money can only move through a bank or cash account held in
+        ${esc(base)}, and there is ${allBanks.length
+          ? `none — the ${allBanks.length === 1 ? 'one on file is' : 'ones on file are'} in another currency`
+          : 'none set up'}. A foreign bank balance needs revaluation, which is phase 6, so the
+        database refuses one rather than reporting a balance it cannot value.</p>`,
+      foot: '<button class="btn" data-close type="button">Close</button>',
+    });
+    return;
+  }
+
+  // Only a customer receipt can be applied to anything: there is no posted
+  // supplier bill to clear until invoice matching exists.
+  let openItems = [];
+  let allocBy = new Map();
+  if (side === 'customer') {
+    openItems = (await api.customerOpenItems()).filter((r) => r.deal_id === deal.id);
+    if (draftId) {
+      const existing = await api.allocations(draftId);
+      allocBy = new Map(existing.map((a) => [a.sales_invoice_id, Number(a.amount)]));
+    }
+  }
+
+  // A rate already on file for the date is what the database would use, so
+  // it is what the field starts on; the market rate is only ever a hint.
+  let onFile = null;
+  if (foreign) {
+    const rates = await api.fxRates();
+    onFile = rates.find((r) => String(r.currency).toUpperCase() === String(cur).toUpperCase()
+      && r.rate_date <= (payment?.paid_on || today)) || null;
+  }
+  const liveRate = foreign ? convert(1, cur, base) : 1;
+  const startRate = payment?.fx_rate ?? onFile?.rate ?? '';
+
+  const allocBlock = side !== 'customer' ? `
+    <div class="notice notice-info" style="margin-top:16px">
+      <strong>This posts as a supplier advance.</strong>
+      The purchase path books goods received to 2110, and nothing credits supplier payables
+      until supplier invoice matching exists — that is the unfinished part of phase 2. So there
+      is no posted bill to clear, and the money is held as an advance on 1400 until there is.
+      Applying it to a bill is refused rather than clearing a payable that was never posted.
+    </div>`
+    : openItems.length ? `
+    <h4 style="margin:18px 0 8px;font-size:14px">Apply to invoices</h4>
+    <div class="table-scroll"><table class="data">
+      <thead><tr>
+        <th>Invoice</th><th>Due</th><th>Age</th>
+        <th class="r">Invoiced</th><th class="r">Credited</th><th class="r">Unpaid before</th>
+        <th class="r">Apply</th><th class="r">Unpaid after</th>
+      </tr></thead>
+      <tbody>
+        ${openItems.map((iv, i) => `<tr data-inv="${iv.sales_invoice_id}" data-i="${i}">
+          <td class="sku">${esc(iv.doc_no || '—')}</td>
+          <td>${esc(dateLabel(iv.due_date) || '—')}</td>
+          <td>${esc(iv.age_bucket)}</td>
+          <td class="r">${fmt(iv.amount, iv.currency, iv.cur_decimals)}</td>
+          <td class="r">${Number(iv.credited)
+            ? fmt(iv.credited, iv.currency, iv.cur_decimals)
+            : '<span class="dim">—</span>'}</td>
+          <td class="r">${fmt(iv.outstanding, iv.currency, iv.cur_decimals)}</td>
+          <td class="r"><input class="qty-in mp-alloc" style="width:112px" type="number" min="0" step="any"
+            value="${allocBy.has(iv.sales_invoice_id) ? allocBy.get(iv.sales_invoice_id)
+              : (preAllocate === iv.sales_invoice_id ? Number(iv.outstanding) : '')}"></td>
+          <td class="r mp-after">—</td>
+        </tr>`).join('')}
+      </tbody>
+      <tfoot><tr>
+        <td colspan="6" class="r">Applied</td>
+        <td class="r" id="mp-applied">—</td><td></td>
+      </tr></tfoot>
+    </table></div>`
+    : `
+    <div class="notice notice-info" style="margin-top:16px">
+      <strong>No posted invoice on this order yet.</strong>
+      Money collected now is held as a customer advance on 2200 and applied once an invoice is
+      raised and posted. Collecting money is not a sale, so nothing here earns revenue.
+    </div>`;
+
+  const m = openModal({
+    title: side === 'customer' ? 'Customer receipt' : 'Supplier payment',
+    width: '900px',
+    body: `
+      <div class="grid-form">
+        <label class="field"><span>${side === 'customer' ? 'Customer' : 'Supplier'}</span>
+          <input type="text" value="${esc(deal.party || '—')}" disabled>
+        </label>
+        <label class="field"><span>Order</span>
+          <input type="text" value="${esc(deal.reference || deal.doc_no || '—')}" disabled>
+        </label>
+        <label class="field"><span>Date</span>
+          <input id="mp-date" type="date" value="${esc(payment?.paid_on || today)}">
+        </label>
+        <label class="field"><span>Bank / cash account</span>
+          <select id="mp-bank">
+            ${banks.map((b) => `<option value="${b.id}"${
+              payment?.bank_account_id === b.id ? ' selected' : ''
+            }>${esc(b.code)} — ${esc(b.name)}</option>`).join('')}
+          </select>
+        </label>
+        <label class="field"><span>${
+          side === 'customer' ? 'Amount received' : 'Settlement amount'} (${esc(cur)})</span>
+          <input id="mp-amount" type="number" min="0" step="any"
+                 value="${payment ? Number(payment.amount) : ''}" autofocus>
+        </label>
+        ${foreign ? `<label class="field"><span>Rate (${esc(base)} per 1 ${esc(cur)})</span>
+          <input id="mp-rate" type="number" min="0" step="any" value="${esc(String(startRate))}"
+                 placeholder="${liveRate ? esc(liveRate.toFixed(6)) : 'enter the rate'}">
+        </label>` : ''}
+        <label class="field"><span>${
+          side === 'customer' ? 'Into the bank' : 'Out of the bank'} (${esc(base)}) <em>(optional)</em></span>
+          <input id="mp-bankamt" type="number" min="0" step="any"
+                 value="${payment?.bank_amount ?? ''}" placeholder="same as the book value">
+        </label>
+        <label class="field"><span>Method <em>(optional)</em></span>
+          <input id="mp-method" type="text" maxlength="60" value="${esc(payment?.method || '')}"
+                 placeholder="bank transfer, cash, cheque">
+        </label>
+        <label class="field wide"><span>Note <em>(optional)</em></span>
+          <input id="mp-note" type="text" maxlength="200" value="${esc(payment?.note || '')}"
+                 placeholder="goes on the journal as its memo">
+        </label>
+      </div>
+      ${foreign ? `<p class="preview-note" style="margin:12px 0 0">
+        ${onFile
+          ? `The rate on file for ${esc(dateLabel(onFile.rate_date))} is ${esc(String(onFile.rate))} ${esc(base)} per ${esc(cur)}, and that is what the field starts on.`
+          : `There is no rate on file for ${esc(cur)}, so one has to be typed here — the ledger refuses to assume 1:1, which would misstate every foreign balance.`}
+        ${liveRate ? ` The market rate right now is about ${esc(liveRate.toFixed(6))}; that is a reference, not the books.` : ''}
+      </p>` : ''}
+      ${allocBlock}
+      <div id="mp-readout" class="entry-preview" style="margin-top:16px"></div>
+      <div id="mp-problem"></div>
+      <div id="mp-journal"></div>
+      <div id="mp-arm"></div>`,
+    foot: `<button class="btn" data-close type="button">Cancel</button>
+           <div class="spacer"></div>
+           <button class="btn" id="mp-preview" type="button">Preview journal</button>
+           <button class="btn" id="mp-draft" type="button">Save draft</button>
+           <button class="btn btn-primary" id="mp-post" type="button">${
+             side === 'customer' ? 'Post receipt' : 'Post payment'}</button>`,
+  });
+
+  const num = (sel) => Math.max(Number(m.querySelector(sel)?.value) || 0, 0);
+  const allocRows = () => [...m.querySelectorAll('tr[data-inv]')].map((tr) => {
+    const iv = openItems[Number(tr.dataset.i)];
+    return {
+      sales_invoice_id: tr.dataset.inv,
+      amount: Math.max(Number(tr.querySelector('.mp-alloc').value) || 0, 0),
+      outstanding: Number(iv.outstanding),
+      label: iv.doc_no || 'this invoice',
+      row: tr,
+    };
+  });
+
+  /* The same shape payment_plan works in: the allocated share carries the
+   * whole exchange difference, because it is the only part with a bill
+   * behind it to compare against. An advance has no bill, so its base value
+   * simply is the money that moved.
+   */
+  const paint = () => {
+    const amount = num('#mp-amount');
+    // An empty rate box is not a rate of zero: with a rate on file the
+    // database resolves it for the date, so the readout shows the figure it
+    // will actually use rather than collapsing the book value to nothing.
+    const rate = foreign ? (num('#mp-rate') || Number(onFile?.rate) || 0) : 1;
+    const rows = allocRows();
+    const applied = rows.reduce((s, r) => s + r.amount, 0);
+    const book = roundTo(amount * rate, baseDec);
+    const bank = num('#mp-bankamt') || book;
+    const advance = roundTo(amount - applied, dec);
+    const allocBook = roundTo(applied * rate, baseDec);
+    const allocBank = applied >= amount ? bank
+      : roundTo(bank * (amount ? applied / amount : 0), baseDec);
+    const diff = roundTo(allocBook - allocBank, baseDec);
+
+    for (const r of rows) {
+      const cell = r.row.querySelector('.mp-after');
+      cell.innerHTML = r.amount > 0
+        ? fmt(roundTo(r.outstanding - r.amount, dec), cur, dec)
+        : '<span class="dim">—</span>';
+    }
+    const appliedCell = m.querySelector('#mp-applied');
+    if (appliedCell) appliedCell.innerHTML = `<b>${fmt(applied, cur, dec)}</b>`;
+
+    const row = (k, v, cls = '') =>
+      `<div class="entry-row${cls ? ` ${cls}` : ''}"><span>${k}</span><b>${v}</b></div>`;
+    m.querySelector('#mp-readout').innerHTML = amount > 0 ? [
+      row(`Money ${side === 'customer' ? 'received' : 'paid'}`, money(amount, cur, dec)),
+      foreign ? row(`Book value at ${rate ? esc(String(rate)) : '—'}`, money(book, base, baseDec)) : '',
+      row(`${side === 'customer' ? 'Into' : 'Out of'} the bank`, money(bank, base, baseDec)),
+      side === 'customer' && applied > 0
+        ? row('Applied to invoices', money(applied, cur, dec)) : '',
+      advance > 0
+        ? row(`Held as ${side === 'customer' ? 'a customer' : 'a supplier'} advance`,
+          money(advance, cur, dec)) : '',
+      side === 'customer' && applied > 0 && diff !== 0
+        ? row(diff > 0 ? 'Exchange loss on collection' : 'Exchange gain on collection',
+          money(Math.abs(diff), base, baseDec), 'entry-total') : '',
+    ].filter(Boolean).join('') : '';
+
+    const bad = [];
+    if (!(amount > 0)) bad.push('Enter an amount above zero.');
+    // A rate is only demanded here when none is on file: with one on file the
+    // database picks the newest on or before the date, which is the figure a
+    // blank box means. What it never does is assume 1:1.
+    if (foreign && !onFile && !(rate > 0)) {
+      bad.push(`There is no exchange rate on file for ${cur}, so type the rate in ${base} per 1 ${cur}. The ledger refuses to assume 1:1 rather than quietly misstating the balance.`);
+    }
+    if (applied > amount) {
+      bad.push(`You are applying ${money(applied, cur, dec)} but only ${money(amount, cur, dec)} came in.`);
+    }
+    for (const r of rows) {
+      if (r.amount > r.outstanding) {
+        bad.push(`${r.label}: applying ${money(r.amount, cur, dec)} but only ${money(r.outstanding, cur, dec)} is unpaid.`);
+      }
+    }
+    m.querySelector('#mp-problem').innerHTML = bad.length ? `
+      <div class="notice notice-err" style="margin-top:12px">
+        <strong>Check this first</strong>
+        <ul style="margin:6px 0 0 18px">${bad.map((b) => `<li>${esc(b)}</li>`).join('')}</ul>
+      </div>` : '';
+    return bad;
+  };
+
+  // Changing a figure invalidates both the previewed journal and the armed
+  // Post button: neither should survive the numbers it was based on.
+  const postBtn = m.querySelector('#mp-post');
+  let armed = false;
+  const disarm = () => {
+    if (!armed) return;
+    armed = false;
+    postBtn.textContent = side === 'customer' ? 'Post receipt' : 'Post payment';
+    postBtn.classList.remove('btn-danger');
+    m.querySelector('#mp-arm').innerHTML = '';
+  };
+  const onEdit = () => { paint(); disarm(); m.querySelector('#mp-journal').innerHTML = ''; };
+  m.querySelectorAll('input, select').forEach((el) => {
+    if (!el.disabled) el.addEventListener('input', onEdit);
+  });
+  paint();
+
+  const save = async () => {
+    if (paint().length) { toast('Fix the highlighted figures first', 'err'); return null; }
+    const paidOn = m.querySelector('#mp-date').value || today;
+    draftId = await api.saveDraftPayment({
+      id: draftId,
+      deal_id: deal.id,
+      amount: num('#mp-amount'),
+      paid_on: paidOn,
+      method: m.querySelector('#mp-method').value.trim(),
+      note: m.querySelector('#mp-note').value.trim(),
+      bank_account_id: m.querySelector('#mp-bank').value,
+      bank_amount: num('#mp-bankamt') || null,
+      fx_rate: foreign ? (num('#mp-rate') || null) : null,
+      rate_date: paidOn,
+    });
+    if (side === 'customer') await api.setAllocations(draftId, allocRows());
+    return draftId;
+  };
+
+  m.querySelector('#mp-draft').onclick = async (e) => {
+    e.target.disabled = true;
+    try {
+      if (await save()) {
+        closeModal();
+        toast('Draft saved — preview it, then post it to write the journal', 'ok');
+        done?.();
+      }
+    } catch (err) {
+      toast(errText(err), 'err');
+    } finally {
+      e.target.disabled = false;
+    }
+  };
+
+  m.querySelector('#mp-preview').onclick = async (e) => {
+    e.target.disabled = true;
+    const box = m.querySelector('#mp-journal');
+    try {
+      const id = await save();
+      if (!id) return;
+      box.innerHTML = journalTable(await api.previewPayment(id), base);
+    } catch (err) {
+      box.innerHTML = `<div class="notice notice-err" style="margin-top:12px">
+        <strong>This cannot post yet.</strong> ${esc(errText(err))}</div>`;
+    } finally {
+      e.target.disabled = false;
+    }
+  };
+
+  /* Two clicks, not a confirmation box: opening one would replace this
+   * dialog and lose everything typed into it.
+   */
+  postBtn.onclick = async () => {
+    if (!armed) {
+      if (paint().length) { toast('Fix the highlighted figures first', 'err'); return; }
+      armed = true;
+      postBtn.textContent = 'Yes, post it';
+      postBtn.classList.add('btn-danger');
+      m.querySelector('#mp-arm').innerHTML = `
+        <div class="notice notice-warn" style="margin-top:12px">
+          <strong>Posting is final.</strong> It writes the journal and
+          ${side === 'customer'
+            ? 'reduces what the customer owes'
+            : 'takes the money out of the bank'}. A posted payment is never edited or deleted —
+          it can only be reversed, which leaves both entries on file. Click again to post.
+        </div>`;
+      return;
+    }
+    postBtn.disabled = true;
+    try {
+      const id = await save();
+      if (!id) { postBtn.disabled = false; return; }
+      await api.postPayment(id, m.querySelector('#mp-note').value.trim());
+      closeModal();
+      toast(side === 'customer' ? 'Receipt posted' : 'Payment posted', 'ok');
+      done?.();
+    } catch (err) {
+      toast(errText(err), 'err');
+      postBtn.disabled = false;
+      disarm();
+    }
+  };
+}
+
+/* The actions shared by the Receivables and Payables screens. */
+function wireMoneyActions({ side, direction, deals, rows, reload }) {
+  const dealOf = (p) => deals.find((d) => d.id === p.deal_id) || {
+    id: p.deal_id,
+    currency: p.deal?.currency,
+    cur_decimals: decOf(p.deal?.currency),
+    party: p.deal?.party?.name || '—',
+    reference: p.deal?.reference || p.deal?.doc_no || '',
+    party_id: p.deal?.party_id || null,
+    direction: p.deal?.direction,
+  };
+
+  onView(async (e) => {
+    const btn = e.target.closest('[data-money]');
+    if (!btn || !canEdit()) return;
+    const act = btn.dataset.money;
+    const id = btn.dataset.id;
+    const p = rows.find((x) => x.id === id);
+    btn.disabled = true;
+    try {
+      if (act === 'new') {
+        const d = await pickOrder(deals, direction);
+        if (d) await moneyDialog({ side, deal: d, done: reload });
+        return;
+      }
+      if (act === 'settle') {
+        const d = deals.find((x) => x.id === btn.dataset.deal);
+        if (!d) { toast('That order is not in the list — open it and record the money there', 'err'); return; }
+        await moneyDialog({ side, deal: d, preAllocate: btn.dataset.invoice || null, done: reload });
+        return;
+      }
+      if (act === 'edit') {
+        await moneyDialog({ side, deal: dealOf(p), payment: p, done: reload });
+        return;
+      }
+      if (act === 'post') {
+        if (!await confirmAction(
+          side === 'customer'
+            ? 'Post this receipt? It writes the journal and reduces what the customer owes. Afterwards it can only be reversed, never edited.'
+            : 'Post this payment? It writes the journal as a supplier advance and takes the money out of the bank. Afterwards it can only be reversed, never edited.',
+          'Post')) return;
+        await api.postPayment(id);
+        toast(side === 'customer' ? 'Receipt posted' : 'Payment posted', 'ok');
+        return reload();
+      }
+      if (act === 'delete') {
+        if (!await confirmAction(
+          'Delete this draft? Nothing has been posted, so no balance changes.', 'Delete')) return;
+        await api.deletePayment(id);
+        toast('Draft deleted', 'ok');
+        return reload();
+      }
+      if (act === 'reverse') {
+        const why = await askWhy({
+          title: 'Reverse this payment',
+          message: 'Reversing writes a mirror journal that cancels this one. Both stay on file and both stay in every balance, because the pair nets to zero — a reversal means corrected, not never happened.',
+          confirmLabel: 'Reverse it',
+          placeholder: 'e.g. wrong bank account, duplicate entry',
+        });
+        if (why === null) return;
+        const n = await api.reversePayment(id, why);
+        toast(`Reversed — ${n} journal${n === 1 ? '' : 's'} cancelled`, 'ok');
+        return reload();
+      }
+    } catch (err) {
+      toast(errText(err), 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+async function viewReceivables() {
+  setLoading();
+  const [base, aging, open, rows, adv, deals] = await Promise.all([
+    api.baseCurrency(),
+    api.arAging(),
+    api.customerOpenItems(),
+    api.moneyRows(),
+    api.customerAdvances(),
+    api.deals({ direction: 'receiving', limit: 300 }),
+  ]);
+  const receipts = rows.filter((r) => r.deal?.direction === 'receiving');
+  const tiles = agingTotals(aging, 'open_invoices');
+  const dealIds = new Set(deals.map((d) => d.id));
+
+  view().innerHTML = `
+    <div class="page-head">
+      <div>
+        <h2>Receivables</h2>
+        <p>What customers owe you, how overdue it is, and the money you have collected.
+          Collecting reduces what a customer owes — it is not another sale, so nothing here
+          earns revenue.</p>
+      </div>
+      <div class="spacer"></div>
+      ${canEdit() ? '<button class="btn btn-accent" data-money="new" type="button">Record a receipt</button>' : ''}
+    </div>
+
+    ${tiles.length ? `<div class="tiles ov-tiles">${tiles.map((t) => moneyTile(t, 'customer')).join('')}</div>` : ''}
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Aging</h3>
+        <div class="spacer"></div>
+        <span class="dim" style="font-size:12.5px">Posted sales invoices, by how late they are</span>
+      </div>
+      <div class="card-body tight">${agingTable(aging, 'customer')}</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Open invoices</h3>
+        <div class="spacer"></div>
+        <span class="dim" style="font-size:12.5px">Unpaid after both receipts and credit notes</span>
+      </div>
+      <div class="card-body tight">
+        ${open.length ? `
+          <div class="table-scroll"><table class="data">
+            <thead><tr>
+              <th>Invoice</th><th>Customer</th><th>Order</th><th>Invoiced</th><th>Due</th><th>Age</th>
+              <th class="r">Amount</th><th class="r">Collected</th><th class="r">Credited</th>
+              <th class="r">Unpaid</th>${canEdit() ? '<th></th>' : ''}
+            </tr></thead>
+            <tbody>
+              ${open.map((iv) => `<tr>
+                <td class="sku">${esc(iv.doc_no || '—')}</td>
+                <td>${esc(iv.party_name || '—')}</td>
+                <td><a href="#/deal/${iv.deal_id}">open</a></td>
+                <td>${esc(dateLabel(iv.invoice_date))}</td>
+                <td>${esc(dateLabel(iv.due_date) || '—')}</td>
+                <td>${esc(iv.age_bucket)}</td>
+                <td class="r">${fmt(iv.amount, iv.currency, iv.cur_decimals)}</td>
+                <td class="r">${Number(iv.allocated)
+                  ? fmt(iv.allocated, iv.currency, iv.cur_decimals) : '<span class="dim">—</span>'}</td>
+                <td class="r">${Number(iv.credited)
+                  ? fmt(iv.credited, iv.currency, iv.cur_decimals) : '<span class="dim">—</span>'}</td>
+                <td class="r"><b>${fmt(iv.outstanding, iv.currency, iv.cur_decimals)}</b> ${esc(iv.currency)}</td>
+                ${canEdit() ? `<td class="act">${dealIds.has(iv.deal_id)
+                  ? `<button class="btn btn-sm" data-money="settle" data-deal="${iv.deal_id}"
+                       data-invoice="${iv.sales_invoice_id}" type="button">Collect</button>`
+                  : ''}</td>` : ''}
+              </tr>`).join('')}
+            </tbody>
+          </table></div>`
+          : `<div class="empty">Nothing unpaid. An invoice appears here once it is posted —
+             a draft invoice is not a debt yet.</div>`}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Receipts</h3>
+        <div class="spacer"></div>
+        ${canEdit() ? '<button class="btn btn-sm btn-accent" data-money="new" type="button">Record a receipt</button>' : ''}
+      </div>
+      <div class="card-body tight">${moneyList(receipts, 'customer', base)}</div>
+    </div>
+
+    ${adv.length ? `
+    <div class="card">
+      <div class="card-head">
+        <h3>Advances held</h3>
+        <div class="spacer"></div>
+        <span class="dim" style="font-size:12.5px">Money collected with no invoice behind it (2200)</span>
+      </div>
+      <div class="card-body tight">
+        ${advanceTable(adv, 'customer', base)}
+        <p class="preview-note" style="padding:10px 12px;margin:0">
+          This is shown on its own and never netted off the aging above: an advance is money you
+          are holding, not an invoice that has been paid. It is applied when an invoice is posted.
+        </p>
+      </div>
+    </div>` : ''}`;
+
+  wireMoneyActions({ side: 'customer', direction: 'receiving', deals, rows: receipts, reload: viewReceivables });
+}
+
+async function viewPayables() {
+  setLoading();
+  const [base, aging, open, rows, adv, deals] = await Promise.all([
+    api.baseCurrency(),
+    api.apAging(),
+    api.supplierOpenItems(),
+    api.moneyRows(),
+    api.supplierAdvances(),
+    api.deals({ direction: 'sending', limit: 300 }),
+  ]);
+  const payments = rows.filter((r) => r.deal?.direction === 'sending');
+  const tiles = agingTotals(aging, 'open_bills');
+  const dealIds = new Set(deals.map((d) => d.id));
+  const noTerms = open.filter((r) => !r.due_date).length;
+
+  view().innerHTML = `
+    <div class="page-head">
+      <div>
+        <h2>Payables</h2>
+        <p>What you still owe suppliers, how overdue it is, and the payments you have made.</p>
+      </div>
+      <div class="spacer"></div>
+      ${canEdit() ? '<button class="btn btn-accent" data-money="new" type="button">Record a payment</button>' : ''}
+    </div>
+
+    ${tiles.length ? `<div class="tiles ov-tiles">${tiles.map((t) => moneyTile(t, 'supplier')).join('')}</div>` : ''}
+
+    <div class="notice notice-warn" style="margin-bottom:18px">
+      <strong>These figures come from the purchase order, not from a matched bill.</strong>
+      Supplier invoice matching is the unfinished part of phase 2, so there is no posted payable
+      yet: what you owe is the order's bill against what has been paid, aged by the invoice date
+      plus the supplier's payment terms. A payment therefore posts as an advance on 1400 rather
+      than clearing payables, and is applied to the bill once matching exists.
+      ${noTerms ? `${noTerms} ${noTerms === 1 ? 'bill has' : 'bills have'} no due date, because the
+        supplier has no payment terms or no invoice date on file — those sit under “Not due”.` : ''}
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Aging</h3>
+        <div class="spacer"></div>
+        <span class="dim" style="font-size:12.5px">By invoice date plus the supplier's terms</span>
+      </div>
+      <div class="card-body tight">${agingTable(aging, 'supplier')}</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Open bills</h3>
+        <div class="spacer"></div>
+        <span class="dim" style="font-size:12.5px">Read from the order — see the warning above</span>
+      </div>
+      <div class="card-body tight">
+        ${open.length ? `
+          <div class="table-scroll"><table class="data">
+            <thead><tr>
+              <th>Supplier</th><th>Account</th><th>Invoice no</th><th>Order</th>
+              <th>Invoiced</th><th>Due</th><th>Age</th>
+              <th class="r">Bill</th><th class="r">Paid</th><th class="r">Left</th>
+              ${canEdit() ? '<th></th>' : ''}
+            </tr></thead>
+            <tbody>
+              ${open.map((b) => `<tr>
+                <td>${esc(b.party_name || '—')}</td>
+                <td>${b.supplier_no || b.sup_code
+                  ? `<span class="uid-chip">${esc(b.supplier_no || b.sup_code)}</span>`
+                  : '<span class="dim">—</span>'}</td>
+                <td class="sku">${esc(b.invoice_no || '—')}</td>
+                <td><a href="#/deal/${b.deal_id}">${esc(b.doc_no || 'open')}</a></td>
+                <td>${esc(dateLabel(b.invoice_date) || '—')}</td>
+                <td>${esc(dateLabel(b.due_date) || '—')}</td>
+                <td>${esc(b.age_bucket)}</td>
+                <td class="r">${fmt(b.amount, b.currency, b.cur_decimals)}</td>
+                <td class="r">${fmt(b.paid, b.currency, b.cur_decimals)}</td>
+                <td class="r">${leftHtml(b.outstanding, b.currency, b.cur_decimals)} ${esc(b.currency)}</td>
+                ${canEdit() ? `<td class="act">${dealIds.has(b.deal_id)
+                  ? `<button class="btn btn-sm" data-money="settle" data-deal="${b.deal_id}" type="button">Pay</button>`
+                  : ''}</td>` : ''}
+              </tr>`).join('')}
+            </tbody>
+          </table></div>`
+          : '<div class="empty">Nothing outstanding on any purchase order.</div>'}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Payments</h3>
+        <div class="spacer"></div>
+        ${canEdit() ? '<button class="btn btn-sm btn-accent" data-money="new" type="button">Record a payment</button>' : ''}
+      </div>
+      <div class="card-body tight">${moneyList(payments, 'supplier', base)}</div>
+    </div>
+
+    ${adv.length ? `
+    <div class="card">
+      <div class="card-head">
+        <h3>Advances paid</h3>
+        <div class="spacer"></div>
+        <span class="dim" style="font-size:12.5px">Money paid with no matched bill behind it (1400)</span>
+      </div>
+      <div class="card-body tight">
+        ${advanceTable(adv, 'supplier', base)}
+        <p class="preview-note" style="padding:10px 12px;margin:0">
+          Every posted supplier payment sits here until supplier invoice matching exists to
+          apply it against a bill. It is money the supplier holds on your behalf, which is
+          why it is an asset rather than a reduction of what you owe.
+        </p>
+      </div>
+    </div>` : ''}`;
+
+  wireMoneyActions({ side: 'supplier', direction: 'sending', deals, rows: payments, reload: viewPayables });
+}
+
+/* Spec page 13's "Bank and currency": what the ledger says each account
+ * holds, and the rates everything foreign is valued at.
+ */
+function fxRateDialog(base, done) {
+  const m = openModal({
+    title: 'Record an exchange rate',
+    width: '580px',
+    body: `
+      <div class="grid-form">
+        <label class="field"><span>Currency</span>
+          <select id="fr-cur">${CURRENCIES
+            .filter((c) => c !== base)
+            .map((c) => `<option>${esc(c)}</option>`).join('')}</select>
+        </label>
+        <label class="field"><span>From this date</span>
+          <input id="fr-date" type="date" value="${todayISO()}">
+        </label>
+        <label class="field"><span>Rate (${esc(base)} per 1 unit)</span>
+          <input id="fr-rate" type="number" min="0" step="any" autofocus>
+        </label>
+        <label class="field wide"><span>Note <em>(optional)</em></span>
+          <input id="fr-note" type="text" maxlength="200" placeholder="where the rate came from">
+        </label>
+      </div>
+      <p class="preview-note" style="margin:12px 0 0">
+        Rates are held as ${esc(base)} per 1 unit of the foreign currency, which is the way the
+        ledger reads them. A payment uses the newest rate on or before its own date, and the
+        database refuses to assume 1:1 when there is none — that would quietly misstate every
+        foreign balance.
+      </p>
+      <div id="fr-live" class="preview-note" style="margin:6px 0 0"></div>`,
+    foot: `<button class="btn" data-close type="button">Cancel</button>
+           <button class="btn btn-primary" id="fr-go" type="button">Save rate</button>`,
+  });
+
+  const live = () => {
+    const c = m.querySelector('#fr-cur').value;
+    const v = convert(1, c, base);
+    m.querySelector('#fr-live').innerHTML = v
+      ? `The market rate right now is about <b>${esc(v.toFixed(6))}</b> ${esc(base)} per ${esc(c)}.`
+      : '';
+  };
+  m.querySelector('#fr-cur').onchange = live;
+  live();
+
+  m.querySelector('#fr-go').onclick = async (e) => {
+    const rate = Number(m.querySelector('#fr-rate').value);
+    if (!(rate > 0)) { toast('Enter a rate above zero.', 'err'); return; }
+    e.target.disabled = true;
+    try {
+      await api.addFxRate({
+        currency: m.querySelector('#fr-cur').value,
+        rate_date: m.querySelector('#fr-date').value || todayISO(),
+        rate,
+        note: m.querySelector('#fr-note').value.trim(),
+      });
+      closeModal();
+      toast('Rate recorded', 'ok');
+      done();
+    } catch (err) {
+      toast(errText(err), 'err');
+      e.target.disabled = false;
+    }
+  };
+}
+
+async function viewBank() {
+  setLoading();
+  const [base, balances, rates, cadv, sadv] = await Promise.all([
+    api.baseCurrency(),
+    api.bankBalances(),
+    api.fxRates(),
+    api.customerAdvances(),
+    api.supplierAdvances(),
+  ]);
+  const baseDec = decOf(base);
+  const total = balances.reduce((s, b) => s + Number(b.balance_base || 0), 0);
+  const foreignBanks = balances.filter((b) => String(b.currency).toUpperCase() !== String(base).toUpperCase());
+
+  // Newest rate per currency: that is the one a payment dated today would use.
+  const latest = [];
+  const seen = new Set();
+  for (const r of rates) {
+    if (seen.has(r.currency)) continue;
+    seen.add(r.currency);
+    latest.push(r);
+  }
+
+  view().innerHTML = `
+    <div class="page-head">
+      <div>
+        <h2>Bank</h2>
+        <p>What the ledger says each account holds, and the rates everything foreign is valued
+          at. Only posted journals move a balance — a draft has not happened yet.</p>
+      </div>
+      <div class="spacer"></div>
+      ${canEdit() ? '<button class="btn" data-bank="new-rate" type="button">Record a rate</button>' : ''}
+    </div>
+
+    ${balances.length ? `<div class="tiles ov-tiles">
+      ${balances.map((b) => `
+        <div class="tile ${Number(b.balance_base) < 0 ? 'tile-out tile-left-due' : 'tile-in tile-left-ok'}">
+          <div class="tile-top"><span class="tile-dot"></span>${esc(b.code)} · ${esc(b.currency)}</div>
+          <div class="tile-val">${signed(b.balance_base, base, baseDec)}<span class="tile-cur">${esc(base)}</span></div>
+          <div class="tile-sub">
+            <span>${esc(b.name)}</span>
+            <span>Ledger <b>${esc(b.gl_code || '—')}</b></span>
+            <span><b>${fmt(b.movements, null, 0)}</b> entr${Number(b.movements) === 1 ? 'y' : 'ies'}</span>
+          </div>
+        </div>`).join('')}
+    </div>` : ''}
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Accounts</h3>
+        <div class="spacer"></div>
+        <span class="dim" style="font-size:12.5px">Balances from posted journals only</span>
+      </div>
+      <div class="card-body tight">
+        ${balances.length ? `
+          <div class="table-scroll"><table class="data">
+            <thead><tr><th>Code</th><th>Name</th><th>Currency</th><th>Ledger account</th>
+              <th class="r">Entries</th><th class="r">Balance (${esc(base)})</th></tr></thead>
+            <tbody>
+              ${balances.map((b) => `<tr>
+                <td class="sku">${esc(b.code)}</td>
+                <td>${esc(b.name)}</td>
+                <td>${esc(b.currency)}</td>
+                <td class="sku">${esc(b.gl_code || '—')}</td>
+                <td class="r">${fmt(b.movements, null, 0)}</td>
+                <td class="r"><b>${signed(b.balance_base, base, baseDec)}</b></td>
+              </tr>`).join('')}
+            </tbody>
+            <tfoot><tr><td colspan="5" class="r">Total held</td>
+              <td class="r"><b>${signed(total, base, baseDec)}</b> ${esc(base)}</td></tr></tfoot>
+          </table></div>
+          ${foreignBanks.length ? `<div class="notice notice-warn" style="margin:12px">
+            <strong>${foreignBanks.length === 1 ? 'One account is' : `${foreignBanks.length} accounts are`}
+            not held in ${esc(base)}.</strong> Money cannot be moved through them yet: a foreign bank
+            balance needs revaluation, which is phase 6, so the database refuses one rather than
+            reporting a figure it cannot value.
+          </div>` : ''}`
+          : `<div class="empty">No bank or cash account set up yet. Money cannot be received or
+             paid through the ledger until there is one held in ${esc(base)}.</div>`}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Exchange rates</h3>
+        <div class="spacer"></div>
+        ${canEdit() ? '<button class="btn btn-sm" data-bank="new-rate" type="button">Record a rate</button>' : ''}
+      </div>
+      <div class="card-body tight">
+        ${rates.length ? `
+          <div class="table-scroll"><table class="data">
+            <thead><tr><th>Currency</th><th>From</th>
+              <th class="r">${esc(base)} per 1 unit</th><th>Note</th><th></th></tr></thead>
+            <tbody>
+              ${rates.map((r) => `<tr>
+                <td>${esc(r.currency)}</td>
+                <td>${esc(dateLabel(r.rate_date))}</td>
+                <td class="r">${esc(String(r.rate))}</td>
+                <td class="desc">${esc(r.note || '')}</td>
+                <td>${latest.includes(r) ? '<span class="tag">In use</span>' : ''}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table></div>`
+          : `<div class="notice notice-warn" style="margin:12px">
+            <strong>No rate is on file.</strong> Until one is recorded, a receipt or payment in
+            anything other than ${esc(base)} has to carry its own rate, typed on the payment
+            itself — the ledger refuses to assume 1:1, because that would misstate every foreign
+            balance rather than failing visibly.
+          </div>`}
+      </div>
+    </div>
+
+    ${cadv.length || sadv.length ? `
+    <div class="card">
+      <div class="card-head">
+        <h3>Advances</h3>
+        <div class="spacer"></div>
+        <span class="dim" style="font-size:12.5px">Money held with no bill behind it</span>
+      </div>
+      <div class="card-body tight">
+        ${cadv.length ? `<p class="preview-note" style="padding:10px 12px 0;margin:0">
+          Collected from customers, held on 2200.</p>${advanceTable(cadv, 'customer', base)}` : ''}
+        ${sadv.length ? `<p class="preview-note" style="padding:10px 12px 0;margin:0">
+          Paid to suppliers, held on 1400.</p>${advanceTable(sadv, 'supplier', base)}` : ''}
+      </div>
+    </div>` : ''}`;
+
+  onView((e) => {
+    const btn = e.target.closest('[data-bank="new-rate"]');
+    if (!btn || !canEdit()) return;
+    fxRateDialog(base, viewBank);
+  });
+}
+
 /* -------------------------------- routing ------------------------------ */
 
 const ROUTES = {
@@ -5766,6 +7191,9 @@ const ROUTES = {
   shipments: viewShipments,
   overview: viewOverview,
   stock: viewStock,
+  receivables: viewReceivables,
+  payables: viewPayables,
+  bank: viewBank,
   accounts: viewAccounts,
   users: viewUsers,
 };
