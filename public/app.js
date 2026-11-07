@@ -464,14 +464,14 @@ const api = {
     return data;
   },
 
-  /* The number a new account of this kind is about to get, without taking
-   * it — a prediction for the form, not a reservation. `next_party_code`
-   * still decides on save. */
-  async peekPartyCode(kind) {
-    const { company } = await api.erpDefaults();
-    const { data, error } = await sb.rpc('peek_party_code', {
-      p_company: company.id,
-      p_kind: kind === 'customer' ? 'customer' : 'supplier',
+  /* The number an account with this NAME is about to get — three letters
+   * from the name, then the first number not used under them. There is no
+   * sequence behind it, so unlike `peek_party_code` this is not a separate
+   * "peek": it is the same function the trigger calls, and asking costs
+   * nothing. */
+  async peekAccountNo(name) {
+    const { data, error } = await sb.rpc('party_code_for', {
+      p_name: String(name || '').trim(),
     });
     if (error) throw error;
     return data;
@@ -494,19 +494,6 @@ const api = {
    * or came from an earlier invoice, and a thinner line on a later invoice
    * should not wipe it. Returns which fields were actually filled in.
    */
-  /* The number a new supplier is about to get, without taking it. Calling
-   * the real generator for a preview would burn a code every time an import
-   * was opened and abandoned, and codes are never reused, so the hole would
-   * be permanent. */
-  async peekSupplierNo() {
-    const { company } = await api.erpDefaults();
-    const { data, error } = await sb.rpc('peek_party_code', {
-      p_company: company.id, p_kind: 'supplier',
-    });
-    if (error) throw error;
-    return data;
-  },
-
   /* Give this account its supplier number, or hand back the one it already
    * has. Safe to call twice: the database reuses what is on file rather than
    * issuing a second number. */
@@ -2387,7 +2374,7 @@ async function viewNewDeal(direction) {
     }
     if (!supno.number) {
       try {
-        supno.number = await api.peekSupplierNo();
+        supno.number = await api.peekAccountNo(name);
         supno.predicted = true;
       } catch { /* the note under the table still explains what happens */ }
     }
@@ -5867,7 +5854,7 @@ function partyDialog(p, done) {
           placeholder="${creating ? 'assigned when you save' : ''}"
           autocapitalize="characters" spellcheck="false"${creating ? ' readonly' : ''}>
         <small class="hint" id="no-hint">${creating
-          ? 'The app issues it — a customer gets CUS…, a supplier SUP….'
+          ? 'Built from the name — three letters, then the next free number.'
           : 'One account, one number. Clearing the box keeps the number on file.'}</small></label>
       <label class="field"><span>Kind</span>
         <select name="kind">${['supplier', 'customer', 'both'].map((k) =>
@@ -5932,21 +5919,33 @@ function partyDialog(p, done) {
              creating ? 'Create account' : 'Save changes'}</button>`,
   });
 
-  /* Show the number the new account is about to get, and follow the kind:
-   * peek_party_code reads the sequence without advancing it, so opening and
-   * abandoning this form cannot burn a code. */
+  /* Show the number the new account is about to get. It is built from the
+   * NAME, so it follows the name box rather than the kind, and it is only a
+   * prediction — the trigger settles it on save. Nothing is reserved by
+   * asking, because the code is computed from the rows that exist rather
+   * than drawn from a sequence. */
+  let peekTimer = null;
   const showNext = async () => {
     if (!creating) return;
-    const kind = $('[name=kind]', m).value;
+    const nm = $('[name=name]', m).value.trim();
+    const box = $('[name=supplier_no]', m);
+    if (!nm) {
+      box.value = '';
+      $('#no-hint', m).textContent = 'Type the name — the number is built from it.';
+      return;
+    }
     try {
-      const next = await api.peekPartyCode(kind);
-      $('[name=supplier_no]', m).value = next || '';
+      const next = await api.peekAccountNo(nm);
+      box.value = next || '';
       $('#no-hint', m).textContent =
-        `${next} — issued when you save. It is a prediction, not a reservation.`;
+        `${next} — issued when you save. A prediction, not a reservation.`;
     } catch { /* the placeholder already says it is assigned on save */ }
   };
   showNext();
-  $('[name=kind]', m).addEventListener('change', showNext);
+  $('[name=name]', m).addEventListener('input', () => {
+    clearTimeout(peekTimer);
+    peekTimer = setTimeout(showNext, 250);
+  });
 
   $('#go', m).onclick = async () => {
     const f = new FormData($('#f', m));

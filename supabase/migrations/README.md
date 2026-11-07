@@ -68,6 +68,7 @@ phase 2's supplier invoicing and phase 6's opening-balance import have no UI yet
 | | `erp_phase6_cancel_opening_balance` | |
 | | `erp_phase6_opening_reports` | |
 | `accounts_screen_and_party_numbering.sql` | `accounts_screen_and_party_numbering` | 20261107* |
+| `party_codes_from_the_name.sql` | `party_codes_from_the_name` | 20261107* |
 
 Each file was applied as several migrations because the tool rejects very large
 statements; the files group them by purpose. They match the deployed state, including
