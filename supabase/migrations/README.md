@@ -9,7 +9,7 @@ can be read and reviewed in a diff instead of only living in the project's histo
 ## What is in this folder
 
 The ERP build described in `Software_Sequence_Charts_With_Module_Screens.pdf`
-(phases 1, 5, 3, 4 and most of 2 of the spec's six-phase build order).
+(phases 1, 2, 3, 4 and 5 of the spec's six-phase build order; only phase 6 is left).
 
 | File | Applied as | Version |
 |------|-----------|---------|
@@ -52,6 +52,14 @@ The ERP build described in `Software_Sequence_Charts_With_Module_Screens.pdf`
 | | `erp_phase4_post_and_reverse` | |
 | | `erp_phase4_aging_and_bank` | |
 | | `erp_phase4_reversed_journals_stay_in_balances` | |
+| `erp_phase2_po_states_and_shipments.sql` | `erp_phase2_doc_prefixes` | 20261105* |
+| | `erp_phase2_approve_purchase_order` | |
+| | `erp_phase2_shipment_allocation` | 20261107* |
+| `erp_phase2_supplier_invoicing_returns_advances.sql` | `erp_phase2_supplier_invoice_tables` | 20261107* |
+| | `erp_phase2_supplier_invoice_matching` | |
+| | `erp_phase2_supplier_returns` | |
+| | `erp_phase2_advance_application` | |
+| | `erp_phase2_payables_read_matched_bills` | |
 
 Each file was applied as several migrations because the tool rejects very large
 statements; the files group them by purpose. They match the deployed state, including
