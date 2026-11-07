@@ -453,6 +453,42 @@ const api = {
     if (error) throw error;
   },
 
+  /* Open an account from the Accounts screen. The number is NOT sent: the
+   * `parties_autonumber` trigger issues it, so a customer comes back CUS0001
+   * and a supplier SUP0012 whatever screen opened them. Sending one here
+   * would be claiming a specific code, which is a different intent. */
+  async createParty(fields) {
+    const { data, error } = await sb.from('parties')
+      .insert(fields).select('*').single();
+    if (error) throw error;
+    return data;
+  },
+
+  /* The number a new account of this kind is about to get, without taking
+   * it — a prediction for the form, not a reservation. `next_party_code`
+   * still decides on save. */
+  async peekPartyCode(kind) {
+    const { company } = await api.erpDefaults();
+    const { data, error } = await sb.rpc('peek_party_code', {
+      p_company: company.id,
+      p_kind: kind === 'customer' ? 'customer' : 'supplier',
+    });
+    if (error) throw error;
+    return data;
+  },
+
+  /* Settle an account's number whatever its kind. Idempotent: what is on
+   * file always wins, so this can be called on an account that already has
+   * one without issuing a second. */
+  async ensureAccountNo(partyId, claim) {
+    if (!partyId) return null;
+    const { data, error } = await sb.rpc('ensure_party_no', {
+      p_party: partyId, p_claim: String(claim || '').trim() || null,
+    });
+    if (error) throw error;
+    return data;
+  },
+
   /* The supplier number and contact details read off an invoice. A detail
    * already on the account is left alone — what is on file was either typed in
    * or came from an earlier invoice, and a thinner line on a later invoice
@@ -2018,6 +2054,102 @@ async function viewSearch(term) {
     </div></div>`;
 }
 
+/* A name box that offers the accounts already on file, best match first.
+ *
+ * Typing a name that is one character off an existing account is how a
+ * balance ends up split across two accounts — the database links a deal to
+ * an account on an exact lowercase name and otherwise opens a new one. So
+ * the picker ranks with `partyScore`, the same tolerant matcher the invoice
+ * import uses, and widens it with plain substring hits so that two or three
+ * letters already narrow the list (partyScore alone wants a distinctive
+ * token of five characters before it scores at all).
+ *
+ * Picking a row is what sets `pickedId`; typing afterwards clears it, so a
+ * caller can tell "they chose this account" from "they typed something that
+ * merely resembles it".
+ */
+function attachPartyPicker(input, direction, onPick) {
+  const wantKind = direction === 'receiving' ? 'customer' : 'supplier';
+  let all = [];
+  let items = [];
+  let at = -1;
+
+  const host = input.closest('.field') || input.parentElement;
+  host.style.position = 'relative';
+  const box = document.createElement('div');
+  box.className = 'suggest';
+  box.hidden = true;
+  host.appendChild(box);
+
+  // One load; the list of accounts does not change while the form is open.
+  api.parties().then(({ parties }) => { all = parties || []; }).catch(() => { all = []; });
+
+  const rank = (q) => {
+    const term = q.trim().toLowerCase();
+    if (!term) return [];
+    return all.map((p) => {
+      const name = String(p.name || '').toLowerCase();
+      const code = String(p.supplier_no || p.uid || '').toLowerCase();
+      let score = partyScore(q, p.name);
+      if (name.startsWith(term)) score = Math.max(score, 0.97);
+      else if (name.includes(term)) score = Math.max(score, 0.85);
+      if (code.includes(term)) score = Math.max(score, 0.9);
+      if (String(p.name_ar || '').includes(q.trim())) score = Math.max(score, 0.85);
+      // An account of the kind this form is for sorts above one that is not.
+      const fits = p.kind === wantKind || p.kind === 'both';
+      return { p, score: score + (fits ? 0.05 : 0) };
+    }).filter((r) => r.score >= 0.45)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8);
+  };
+
+  const close = () => { box.hidden = true; items = []; at = -1; };
+
+  const paint = () => {
+    if (!items.length) { close(); return; }
+    box.innerHTML = items.map((r, i) => `
+      <button class="suggest-row${i === at ? ' is-on' : ''}" type="button" data-i="${i}">
+        <span class="suggest-kind">${esc(r.p.supplier_no || r.p.uid || '')}</span>
+        <span class="suggest-label">${esc(r.p.name)}</span>
+        <span class="suggest-sub">${esc([KIND_TEXT[r.p.kind] || r.p.kind,
+          r.p.name_ar, r.p.mobile].filter(Boolean).join(' · '))}</span>
+      </button>`).join('');
+    box.hidden = false;
+  };
+
+  const choose = (i) => {
+    const r = items[i];
+    if (!r) return;
+    input.value = r.p.name;
+    close();
+    onPick?.(r.p);
+  };
+
+  input.setAttribute('autocomplete', 'off');
+  input.addEventListener('input', () => {
+    onPick?.(null);               // typing means they have not chosen one
+    items = rank(input.value);
+    at = -1;
+    paint();
+  });
+  input.addEventListener('focus', () => {
+    if (input.value.trim()) { items = rank(input.value); paint(); }
+  });
+  input.addEventListener('keydown', (e) => {
+    if (box.hidden || !items.length) return;
+    if (e.key === 'ArrowDown') { e.preventDefault(); at = (at + 1) % items.length; paint(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); at = (at - 1 + items.length) % items.length; paint(); }
+    else if (e.key === 'Enter' && at >= 0) { e.preventDefault(); choose(at); }
+    else if (e.key === 'Escape') { close(); }
+  });
+  // mousedown, not click: blur fires first and would hide the row.
+  box.addEventListener('mousedown', (e) => {
+    const b = e.target.closest('[data-i]');
+    if (b) { e.preventDefault(); choose(Number(b.dataset.i)); }
+  });
+  input.addEventListener('blur', () => setTimeout(close, 120));
+}
+
 async function viewNewDeal(direction) {
   if (!canEdit()) return viewDenied();
   const dir = DIR[direction];
@@ -2364,6 +2496,18 @@ async function viewNewDeal(direction) {
     e.preventDefault(); drop.classList.remove('is-over');
     take(e.dataTransfer.files[0]);
   });
+
+  /* Pick the account by name instead of retyping it. A name one character
+   * off an existing one opens a second account and splits that party's
+   * balance, which is the whole reason this box offers matches. Choosing a
+   * supplier also settles their number into the field, through the same
+   * path an imported invoice uses. */
+  const partyInput = $('#new-form [name=party]');
+  if (partyInput) {
+    attachPartyPicker(partyInput, direction, (picked) => {
+      if (picked && direction === 'sending') settleSupplierNo(picked.name, null);
+    });
+  }
 
   $('#new-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -5495,60 +5639,84 @@ async function viewAccounts() {
     byParty.get(t.party_id).push(t);
   }
 
-  // An account only shows while it has a live order. Ones whose every order
-  // was deleted (the sample data) stay in the database but out of this list.
-  const rowsFor = (q) => parties.filter((p) => byParty.has(p.id)
-      && matchAny(q, [p.uid, p.name, p.kind, p.supplier_no, p.details])).map((p) => {
+  /* Every account shows, including one with no orders behind it yet. An
+   * account opened from this screen has no orders by definition, so the old
+   * "only while it has a live order" filter would have hidden it the moment
+   * it was created. */
+  const rowsFor = (q, kind) => parties.filter((p) => (kind === 'all'
+        || p.kind === kind || p.kind === 'both')
+      && matchAny(q, [p.uid, p.name, p.name_ar, p.kind, p.supplier_no,
+        p.mobile, p.phone_office, p.email, p.details])).map((p) => {
     const lines = byParty.get(p.id) || [];
-    const owed = lines.filter((l) => Number(l.balance) !== 0);
+    const orders = lines.reduce((a, l) => a + Number(l.deal_count), 0);
     return `
-      <a class="row-acct" href="#/party/${p.id}">
-        <span class="uid-chip">${esc(p.uid)}</span>
-        <div class="row-party">
-          <strong>${esc(p.name)}</strong>
-          <div class="row-meta">
-            <span>${esc(KIND_TEXT[p.kind] || p.kind)}</span>
-            ${p.supplier_no ? `<span class="sku">${esc(p.supplier_no)}</span>` : ''}
-            <span>${lines.reduce((a, l) => a + Number(l.deal_count), 0)} order${
-              lines.reduce((a, l) => a + Number(l.deal_count), 0) === 1 ? '' : 's'}</span>
-          </div>
-        </div>
-        <div class="acct-bals">
-          ${lines.length
-            ? lines.map((l) => `<span class="pill pill-bal bal-${BALANCE[l.balance_state].cls}">
-                ${signed(l.balance, l.currency, l.cur_decimals)} ${esc(l.currency)}
-                <em>${l.balance_state === 'even' ? 'even'
-                     : l.balance_state === 'party_owes' ? 'owes you' : 'you owe'}</em>
-              </span>`).join('')
-            : '<span class="dim">no orders yet</span>'}
-        </div>
-      </a>`;
+      <tr data-href="#/party/${p.id}">
+        <td><span class="uid-chip">${esc(p.supplier_no || p.uid)}</span></td>
+        <td><strong>${esc(p.name)}</strong>${p.active === false
+          ? ' <span class="tag">inactive</span>' : ''}</td>
+        <td dir="rtl">${p.name_ar ? esc(p.name_ar) : '<span class="dim">—</span>'}</td>
+        <td>${esc(KIND_TEXT[p.kind] || p.kind)}</td>
+        <td>${p.mobile ? esc(p.mobile) : '<span class="dim">—</span>'}</td>
+        <td>${p.phone_office ? esc(p.phone_office) : '<span class="dim">—</span>'}</td>
+        <td class="r">${orders ? fmt(orders, null, 0) : '<span class="dim">—</span>'}</td>
+        <td class="r">${lines.length
+          ? lines.map((l) => `<span class="pill pill-bal bal-${BALANCE[l.balance_state].cls}">
+              ${signed(l.balance, l.currency, l.cur_decimals)} ${esc(l.currency)}</span>`).join(' ')
+          : '<span class="dim">—</span>'}</td>
+      </tr>`;
   }).join('');
 
   view().innerHTML = `
     <div class="page-head">
       <div>
         <h2>Accounts</h2>
-        <p>Every customer and supplier, each with its own id. An account is even when the
-          money that moved and the goods that moved match.</p>
+        <p>Every customer and supplier, each with the account number this app gave them.
+          An account is even when the money that moved and the goods that moved match.</p>
       </div>
       <div class="spacer"></div>
       <div class="table-tools">
-        <input type="search" id="acct-q" placeholder="Search name or UID, e.g. GU8151">
+        <select id="acct-kind">
+          <option value="all">All accounts</option>
+          <option value="customer">Customers</option>
+          <option value="supplier">Suppliers</option>
+        </select>
+        <input type="search" id="acct-q" placeholder="Search name, number, mobile…">
+        ${canEdit() ? '<button class="btn btn-primary" id="acct-new" type="button">New account</button>' : ''}
       </div>
     </div>
 
-    <div class="card"><div class="card-body tight" id="acct-rows"></div></div>`;
+    <div class="card"><div class="card-body tight">
+      <div class="table-scroll"><table class="data" id="acct-table">
+        <thead><tr>
+          <th>Code</th><th>Account name</th><th>Name (Arabic)</th><th>Kind</th>
+          <th>Mobile</th><th>Telephone</th><th class="r">Orders</th><th class="r">Balance</th>
+        </tr></thead>
+        <tbody id="acct-rows"></tbody>
+      </table></div>
+    </div></div>`;
 
   const paintAccts = () => {
     const q = $('#acct-q').value.trim().toLowerCase();
-    const rows = rowsFor(q);
-    $('#acct-rows').innerHTML = rows ? `<div class="rows">${rows}</div>`
-      : `<div class="empty">${q ? 'No account matches that name or UID.'
-          : 'No accounts yet. They open themselves as you add orders.'}</div>`;
+    const kind = $('#acct-kind').value;
+    const rows = rowsFor(q, kind);
+    $('#acct-rows').innerHTML = rows || `<tr><td colspan="8"><div class="empty">${
+      q ? 'No account matches that.' : 'No accounts yet — open one with New account.'
+    }</div></td></tr>`;
   };
   paintAccts();
   $('#acct-q').addEventListener('input', paintAccts);
+  $('#acct-kind').addEventListener('change', paintAccts);
+
+  // The whole row is the link, so the table reads like the rest of the app.
+  $('#acct-table').addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-href]');
+    if (tr) location.hash = tr.dataset.href;
+  });
+
+  $('#acct-new')?.addEventListener('click', () => partyDialog(null, (row) => {
+    if (row?.id) location.hash = `#/party/${row.id}`;
+    else viewAccounts();
+  }));
 }
 
 async function viewParty(id) {
@@ -5621,11 +5789,23 @@ async function viewParty(id) {
           <span>${esc(KIND_TEXT[p.kind] || p.kind)}</span>
         </div>
         <h2>${esc(p.name)} <span class="uid-chip is-big">${esc(p.uid)}</span></h2>
+        ${p.name_ar ? `<p class="party-details" dir="rtl">${esc(p.name_ar)}</p>` : ''}
         ${p.supplier_no ? `<p class="row-meta"><span>${
           esc(KIND_TEXT[p.kind] === 'Customer' ? 'Customer no' : 'Supplier no')}</span>
           <strong class="sku">${esc(p.supplier_no)}</strong></p>` : ''}
+        ${(() => {
+          // The contact fields, shown only where one is actually filled in.
+          const bits = [
+            p.contact_person && `Attn ${p.contact_person}`,
+            p.mobile, p.phone_office, p.email, p.address,
+            p.tax_id && `CR ${p.tax_id}`,
+          ].filter(Boolean).map(esc);
+          return bits.length ? `<p class="party-details">${bits.join(' · ')}</p>` : '';
+        })()}
         ${p.details ? `<p class="party-details">${esc(p.details)}</p>` : ''}
         ${p.notes ? `<p>${esc(p.notes)}</p>` : ''}
+        ${p.active === false
+          ? '<p class="row-meta"><span class="tag">Inactive account</span></p>' : ''}
       </div>
       <div class="spacer"></div>
       ${canEdit() ? '<button class="btn" data-act="edit-party" type="button">Edit details</button>' : ''}
@@ -5662,50 +5842,160 @@ async function viewParty(id) {
   $('[data-act=edit-party]')?.addEventListener('click', () => partyDialog(p, () => viewParty(id)));
 }
 
+/* The account screen, for opening a new customer or supplier and for editing
+ * one already on file. `p` is null for a new account.
+ *
+ * It carries the fields of the old Account Receivable screen that still mean
+ * something here. Deliberately NOT carried over: Category 1/2, Date of Birth,
+ * Any Price, Sales Flag, Branch 1/2, Alternate Print / SPCL / Print[1/0],
+ * Salesman, Pager, Fax and Res.Tel — none of them has anything behind it in
+ * this app, and a field that saves nowhere is worse than no field. P.O. Box
+ * folds into the address.
+ */
 function partyDialog(p, done) {
-  const word = p.kind === 'customer' ? 'Customer' : 'Supplier';
+  const creating = !p;
+  const acct = p || { kind: 'supplier', active: true };
+  const word = acct.kind === 'customer' ? 'Customer' : 'Supplier';
+  const val = (k, d = '') => esc(acct[k] ?? d);
+
   const m = openModal({
-    title: `Edit ${p.name}`,
-    width: '620px',
+    title: creating ? 'New account' : `Edit ${acct.name}`,
+    width: '760px',
     body: `<form id="f" class="grid-form">
-      <label class="field wide"><span>Name</span>
-        <input name="name" value="${esc(p.name)}" required></label>
-      <label class="field"><span>${word} number <em>(your account number for them)</em></span>
-        <input name="supplier_no" value="${esc(p.supplier_no || '')}"
-          placeholder="e.g. SUP0012" autocapitalize="characters" spellcheck="false">
-        <small class="hint">One account, one number. Leave it alone unless it is wrong — clearing the box keeps the number already on file.</small></label>
+      <label class="field"><span>Account number</span>
+        <input name="supplier_no" value="${val('supplier_no')}"
+          placeholder="${creating ? 'assigned when you save' : ''}"
+          autocapitalize="characters" spellcheck="false"${creating ? ' readonly' : ''}>
+        <small class="hint" id="no-hint">${creating
+          ? 'The app issues it — a customer gets CUS…, a supplier SUP….'
+          : 'One account, one number. Clearing the box keeps the number on file.'}</small></label>
       <label class="field"><span>Kind</span>
         <select name="kind">${['supplier', 'customer', 'both'].map((k) =>
-          `<option value="${k}"${k === p.kind ? ' selected' : ''}>${KIND_TEXT[k]}</option>`).join('')}</select></label>
+          `<option value="${k}"${k === acct.kind ? ' selected' : ''}>${KIND_TEXT[k]}</option>`).join('')}</select></label>
+
+      <label class="field"><span>Name (English)</span>
+        <input name="name" value="${val('name')}" required autocomplete="off"></label>
+      <label class="field"><span>Name (Arabic)</span>
+        <input name="name_ar" value="${val('name_ar')}" dir="rtl" autocomplete="off"></label>
+
+      <label class="field"><span>Person to contact</span>
+        <input name="contact_person" value="${val('contact_person')}" autocomplete="off"></label>
+      <label class="field"><span>Mobile</span>
+        <input name="mobile" value="${val('mobile')}" autocomplete="off" placeholder="+965 0000 0000"></label>
+
+      <label class="field"><span>Telephone (office)</span>
+        <input name="phone_office" value="${val('phone_office')}" autocomplete="off"></label>
+      <label class="field"><span>E-mail</span>
+        <input name="email" type="email" value="${val('email')}" autocomplete="off"></label>
+
+      <label class="field wide"><span>Address</span>
+        <textarea name="address" rows="2" placeholder="Street, area, P.O. Box, city">${val('address')}</textarea></label>
+
+      <label class="field"><span>CR number <em>(commercial registration)</em></span>
+        <input name="tax_id" value="${val('tax_id')}" autocomplete="off"></label>
+      <label class="field"><span>Credit limit</span>
+        <input name="credit_limit" type="number" step="0.001" min="0"
+          value="${acct.credit_limit ?? ''}" placeholder="0.000"></label>
+
+      <label class="field"><span>Currency</span>
+        <select name="default_currency">
+          <option value="">—</option>
+          ${CURRENCIES.map((c) => `<option value="${c}"${
+            c === acct.default_currency ? ' selected' : ''}>${c}</option>`).join('')}
+        </select></label>
+      <label class="field"><span>Payment terms <em>(days)</em></span>
+        <input name="payment_terms_days" type="number" step="1" min="0"
+          value="${acct.payment_terms_days ?? ''}" placeholder="0"></label>
+
+      <label class="field"><span>Active</span>
+        <select name="active">
+          <option value="yes"${acct.active !== false ? ' selected' : ''}>Yes</option>
+          <option value="no"${acct.active === false ? ' selected' : ''}>No</option>
+        </select></label>
+      <label class="field"><span>Ledger account</span>
+        <input value="${acct.kind === 'customer'
+          ? '1200 · Accounts receivable' : '2100 · Accounts payable'}" readonly>
+        <small class="hint">Set by the posting templates, not per account.</small></label>
+
       <label class="field wide"><span>${word} details <em>(their phone, address, email — not yours)</em></span>
-        <textarea name="details" rows="3" placeholder="+965 0000 0000 | Street, City | sales@example.com">${esc(p.details || '')}</textarea></label>
-      <label class="field wide"><span>Notes</span>
-        <textarea name="notes" rows="2">${esc(p.notes || '')}</textarea></label>
+        <textarea name="details" rows="2" placeholder="+965 0000 0000 | Street, City | sales@example.com">${val('details')}</textarea></label>
+      <label class="field wide"><span>Remark</span>
+        <textarea name="notes" rows="2">${val('notes')}</textarea></label>
+
+      ${creating ? '' : `<p class="preview-note wide" style="margin:0">
+        Created ${esc(dateLabel(String(acct.created_at || '').slice(0, 10)))}${acct.updated_at
+          ? ` · last changed ${esc(dateLabel(String(acct.updated_at).slice(0, 10)))}` : ''}
+      </p>`}
     </form>`,
     foot: `<button class="btn" data-close type="button">Cancel</button>
-           <button class="btn btn-primary" id="go" type="button">Save changes</button>`,
+           <button class="btn btn-primary" id="go" type="button">${
+             creating ? 'Create account' : 'Save changes'}</button>`,
   });
+
+  /* Show the number the new account is about to get, and follow the kind:
+   * peek_party_code reads the sequence without advancing it, so opening and
+   * abandoning this form cannot burn a code. */
+  const showNext = async () => {
+    if (!creating) return;
+    const kind = $('[name=kind]', m).value;
+    try {
+      const next = await api.peekPartyCode(kind);
+      $('[name=supplier_no]', m).value = next || '';
+      $('#no-hint', m).textContent =
+        `${next} — issued when you save. It is a prediction, not a reservation.`;
+    } catch { /* the placeholder already says it is assigned on save */ }
+  };
+  showNext();
+  $('[name=kind]', m).addEventListener('change', showNext);
 
   $('#go', m).onclick = async () => {
     const f = new FormData($('#f', m));
     const name = String(f.get('name') || '').trim();
     if (!name) return toast('An account needs a name.', 'err');
-    const wanted = String(f.get('supplier_no') || '').trim();
-
-    const patch = {
-      name,
-      kind: f.get('kind'),
-      details: String(f.get('details') || '').trim() || null,
-      notes: String(f.get('notes') || '').trim() || null,
+    const num = (k) => {
+      const raw = String(f.get(k) || '').trim();
+      return raw === '' ? null : Number(raw);
     };
-    /* An account must never end up unnumbered, so an emptied box keeps what
-     * is on file rather than wiping it. Blanking a number is not a thing you
-     * can mean — every account needs one. */
-    if (wanted) patch.supplier_no = wanted;
+    const txt = (k) => String(f.get(k) || '').trim();
 
+    const fields = {
+      name,
+      name_ar: txt('name_ar'),
+      kind: f.get('kind'),
+      contact_person: txt('contact_person'),
+      mobile: txt('mobile'),
+      phone_office: txt('phone_office'),
+      email: txt('email'),
+      address: txt('address'),
+      /* `notes`, `tax_id`, `credit_limit` and `payment_terms_days` are NOT
+       * NULL on `parties` with empty-string / zero defaults, so an empty box
+       * sends the empty value, never null. Only `details` and
+       * `default_currency` are nullable. */
+      tax_id: txt('tax_id'),
+      credit_limit: num('credit_limit') ?? 0,
+      default_currency: txt('default_currency') || null,
+      payment_terms_days: num('payment_terms_days') ?? 0,
+      active: f.get('active') !== 'no',
+      details: txt('details') || null,
+      notes: txt('notes'),
+    };
+
+    const wanted = txt('supplier_no');
     try {
-      await api.updateParty(p.id, patch);
-      closeModal(); toast('Saved', 'ok'); done();
+      if (creating) {
+        /* No number is sent: the trigger issues it, so the code comes from
+         * the same generator whatever screen opened the account. */
+        const row = await api.createParty(fields);
+        closeModal();
+        toast(`${row.name} opened as ${row.supplier_no || 'a new account'}`, 'ok');
+        done(row);
+        return;
+      }
+      /* An account must never end up unnumbered, so an emptied box keeps
+       * what is on file rather than wiping it. */
+      if (wanted) fields.supplier_no = wanted;
+      await api.updateParty(acct.id, fields);
+      closeModal(); toast('Saved', 'ok'); done(acct);
     } catch (e) {
       /* The unique index is what stops two accounts sharing a number. Say
        * whose it is rather than showing the raw constraint name. */
@@ -5713,7 +6003,7 @@ function partyDialog(p, done) {
         let owner = '';
         try {
           const { parties } = await api.parties();
-          const clash = parties.find((x) => x.id !== p.id
+          const clash = parties.find((x) => x.id !== acct.id
             && String(x.supplier_no || '').trim().toLowerCase() === wanted.toLowerCase());
           if (clash) owner = ` — it belongs to ${clash.name}`;
         } catch { /* the message below still says enough */ }
