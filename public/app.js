@@ -477,6 +477,16 @@ const api = {
     return data;
   },
 
+  /* Delete an account outright. The database refuses one that has orders,
+   * invoices or ledger entries behind it and says which — deleting it would
+   * leave that history pointing at nothing. Marking it inactive is the
+   * answer for those. */
+  async deleteParty(partyId) {
+    const { data, error } = await sb.rpc('delete_party', { p_party: partyId });
+    if (error) throw error;
+    return data;
+  },
+
   /* Settle an account's number whatever its kind. Idempotent: what is on
    * file always wins, so this can be called on an account that already has
    * one without issuing a second. */
@@ -5914,10 +5924,41 @@ function partyDialog(p, done) {
           ? ` · last changed ${esc(dateLabel(String(acct.updated_at).slice(0, 10)))}` : ''}
       </p>`}
     </form>`,
-    foot: `<button class="btn" data-close type="button">Cancel</button>
+    foot: `${creating ? '' :
+             '<button class="btn btn-danger" id="kill" type="button">Delete account</button>'}
+           <div class="spacer"></div>
+           <button class="btn" data-close type="button">Cancel</button>
            <button class="btn btn-primary" id="go" type="button">${
              creating ? 'Create account' : 'Save changes'}</button>`,
   });
+
+  /* Deleting is armed by a second click rather than a confirm box, the same
+   * way posting a payment is: `openModal` calls `closeModal` first, so a
+   * dialog raised from in here would destroy this one and everything typed
+   * into it. */
+  if (!creating) {
+    let armed = false;
+    const kill = $('#kill', m);
+    kill.onclick = async () => {
+      if (!armed) {
+        armed = true;
+        kill.textContent = 'Click again to delete for good';
+        kill.classList.add('is-armed');
+        return;
+      }
+      try {
+        const gone = await api.deleteParty(acct.id);
+        closeModal();
+        toast(`${gone} deleted`, 'ok');
+        location.hash = '#/accounts';
+      } catch (e) {
+        armed = false;
+        kill.textContent = 'Delete account';
+        kill.classList.remove('is-armed');
+        toast(errText(e), 'err');
+      }
+    };
+  }
 
   /* Show the number the new account is about to get. It is built from the
    * NAME, so it follows the name box rather than the kind, and it is only a

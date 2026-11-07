@@ -199,6 +199,8 @@ svg {
 
 .btn-danger { color: var(--due); border-color: color-mix(in srgb, var(--due) 35%, var(--rule-2)); }
 .btn-danger:hover:not(:disabled) { background: var(--due-wash); border-color: var(--due); }
+/* A destructive button waiting for its second click. */
+.btn-danger.is-armed { background: var(--due); border-color: var(--due); color: #fff; }
 
 .btn-ghost { border-color: transparent; background: transparent; color: var(--ink-2); }
 .btn-ghost:hover:not(:disabled) { background: var(--sunk); color: var(--ink); border-color: transparent; }
